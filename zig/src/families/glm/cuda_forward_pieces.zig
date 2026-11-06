@@ -125,7 +125,7 @@ pub fn partials(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usi
         .nccl => |x| {
             const r = f.ranks[0];
             // A pair without verbs: a large piece's all-gather takes the rails' TCP path when it fits (group.tcpFits).
-            if (x.group) |g| if (g.tcpFits(p.side.handle, bytes)) return g.allGather(p.side, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
+            if (x.group) |g| if (g.tcpFits(bytes)) return g.allGather(p.side, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
             try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
         },
     } else switch (f.exchange) {

@@ -80,9 +80,9 @@ pub const Group = struct {
         };
     }
 
-    /// Whether a gather of `bytes` on `s` would take the TCP path (the size alone decides, so both ranks agree).
-    pub fn tcpFits(g: *const Group, s: abi.Stream, bytes: usize) bool {
-        return if (g.tcp) |t| t.fits(s, bytes) else false;
+    /// Whether a gather of `bytes` would take the TCP path (the size alone decides, so both ranks agree).
+    pub fn tcpFits(g: *const Group, bytes: usize) bool {
+        return if (g.tcp) |t| t.fits(bytes) else false;
     }
 
     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
@@ -96,7 +96,7 @@ pub const Group = struct {
     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
         if (g.p2p) |p| if (p.fits(s.handle, bytes)) return p.gather(s, mine, all, bytes);
         if (g.fast) |f| if (f.fits(bytes)) return f.gather(s.handle, mine, all, bytes);
-        if (g.tcp) |t| if (t.fits(s.handle, bytes)) return t.gather(s.handle, mine, all, bytes);
+        if (g.tcp) |t| if (t.fits(bytes)) return t.gather(s.handle, mine, all, bytes);
         try g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
     }
 

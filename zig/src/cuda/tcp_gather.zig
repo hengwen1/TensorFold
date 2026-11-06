@@ -1,14 +1,16 @@
-//! Two ranks on different hosts with no verbs device: a stream's large all-gathers over the rails' TCP sockets.
+//! Two ranks on different hosts with no verbs device: the engine's large all-gathers over the rails' TCP sockets.
 //!
 //! NCCL's socket transport on a Jetson AGX Thor pair carries an exchange on effectively one rail (measured: the same
-//! 16 MiB gather costs the same with one interface as with four). This path spreads it over every rail the launcher
-//! found, in the shape the Thor EXL3 backend's prefill_transport.py uses: a pinned, device-mapped staging buffer per
-//! stream and `conns` TCP connections striped over the rails (`i % rails`). It is meant for prompt pieces (MiBs), not
-//! decode: TF_TCP_GATHER_MIN_KB keeps the small gathers on NCCL.
+//! 16 MiB gather with one interface and with four). This path spreads it over every rail the launcher found, in the
+//! shape the Thor EXL3 backend's prefill_transport.py uses: one pinned, device-mapped staging buffer and
+//! TF_TCP_GATHER_CONNS TCP connections striped over the rails (i % rails).
 //!
-//! Stream order is kept without a host synchronize: the caller orders its producer with a 32-bit value on its own
-//! stream (cuStreamWriteValue32), the worker waits for it on its copy stream (cuStreamWaitValue32), and the worker
-//! publishes completion the same way. Both values only grow, so nothing is re-recorded behind a waiter.
+//! One connection set serves every stream: jobs run through one FIFO, so the k-th TCP exchange on one rank meets the
+//! k-th on the other, as NCCL's own collectives pair by issue order. Per-stream ordering is kept without a host
+//! synchronize: the caller orders its producer with a 32-bit value on its own stream (cuStreamWriteValue32 into this
+//! rank's ready word), the worker waits it on its copy stream (cuStreamWaitValue32), and the worker publishes
+//! completion into the global done word the same way. Every value only grows, so nothing is re-recorded behind a
+//! waiter. It is meant for prompt pieces (MiBs); TF_TCP_GATHER_MIN_KB keeps decode's small gathers on NCCL.
 //!
 //! Settings (both ranks must ask; the smaller cap wins, and the size alone decides, so both ranks take one path):
 //!   TF_TCP_GATHER=1                   enable (default: off)
@@ -17,8 +19,8 @@
 //!   TF_TCP_GATHER_MIN_KB=2048         smallest shard it takes (below it NCCL keeps the gather)
 //!   TF_TCP_GATHER_MAX_KB=32768        largest shard it takes (a rank's bytes)
 //!   TF_TCP_GATHER_CONNS=8             connections, striped over the rails
-//!   TF_TCP_GATHER_PORT=30680          the first port (channel k uses PORT + k * CONNS .. + CONNS - 1)
-//!   TF_TCP_GATHER_TIMEOUT_S=60        a socket operation's limit
+//!   TF_TCP_GATHER_PORT=30680          the first port (CONNS of them; channel k would take the next block)
+//!   TF_TCP_GATHER_TIMEOUT_S=60        a connect, an exchange's wait for the peer, all in poll ticks (no clock needed)
 const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
@@ -28,9 +30,9 @@ const Stream = stream_mod.Stream;
 const tp_group = @import("tp_group.zig");
 
 pub const max_conns = 8;
-pub const max_channels = 4;
 pub const max_rails = 4;
-const depth = 4; // jobs a stream may have in flight (the engine posts a prompt piece's gathers back to back)
+pub const slots = 8; // streams the path can serve (each gets a ready word; the engine uses two or three)
+const depth = 8; // jobs in flight; the engine posts a prompt piece's gathers back to back
 const header_bytes = 16; // sequence and length, big endian
 
 const wait_geq: c_uint = 0; // CU_STREAM_WAIT_VALUE_GEQ
@@ -80,20 +82,20 @@ fn ipv4(host_order: u32) std.c.sockaddr.in {
     return .{ .family = std.c.AF.INET, .port = 0, .addr = std.mem.nativeToBig(u32, host_order) };
 }
 
+fn closeFd(fd: std.c.fd_t) void {
+    if (fd >= 0) _ = std.c.close(fd);
+}
+
 fn sleepMs(ms: u64) void {
     var ts: std.c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = std.c.nanosleep(&ts, null);
 }
 
-/// Monotonic nanoseconds, for deadlines and the staging/exchange split.
+/// Monotonic nanoseconds, for the staging/exchange split in the counters (never a deadline; the clock is not trusted).
 fn monotonicNs() i128 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
-}
-
-fn closeFd(fd: std.c.fd_t) void {
-    if (fd >= 0) _ = std.c.close(fd);
 }
 
 fn setTimeouts(fd: std.c.fd_t, seconds: u64) void {
@@ -112,13 +114,6 @@ fn setNonBlocking(fd: std.c.fd_t) void {
     _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(flags)));
 }
 
-const Job = struct {
-    mine: abi.DevicePtr,
-    all: abi.DevicePtr,
-    bytes: usize,
-    seq: u32,
-};
-
 /// One connection's part of one exchange: a stripe of the buffer, sent and received at once.
 const Stripe = struct {
     fd: std.c.fd_t,
@@ -133,118 +128,128 @@ const Stripe = struct {
     receiving: bool = true,
 };
 
-/// One stream's gathers: its own staging buffer, copy stream, flag words, connections and worker.
-const Channel = struct {
-    g: *Gather,
-    index: usize,
-    stream: abi.Stream,
-    host: memory.HostBuffer, // [0, cap): this rank's shard, [cap, 2 * cap): the peer's
-    flags: memory.HostBuffer, // ready, done: u32 each
-    ready_dev: abi.DevicePtr = 0,
-    done_dev: abi.DevicePtr = 0,
-    net: Stream,
+/// One job: a gather one stream posted. `id` pairs the exchange with the peer's k-th (both ranks issue the same
+/// sequence); `slot` and `seq` address this rank's own ready word, never the peer's.
+const Job = struct {
+    mine: abi.DevicePtr,
+    all: abi.DevicePtr,
+    bytes: usize,
+    id: u32,
+    slot: u5,
+    seq: u32,
+};
+
+pub const Gather = struct {
+    d: *const Driver,
+    gpa: std.mem.Allocator,
+    group: *const tp_group.Group,
+    rank: u32,
+    cap: usize,
+    min_bytes: usize,
+    conns: usize,
+    port: u16,
+    timeout_s: u64,
+    rails: [max_rails]u32 = @splat(0),
+    peer_rails: [max_rails]u32 = @splat(0),
+    n_rails: usize = 0,
+    ctx: abi.Context = null, // the engine thread's context; the worker must set it before any driver call
+    host: memory.HostBuffer = undefined, // [0, cap): this rank's shard, [cap, 2 * cap): the peer's
+    flags: memory.HostBuffer = undefined, // done at 0, then one ready word a slot
+    host_dev: abi.DevicePtr = 0,
+    flags_dev: abi.DevicePtr = 0,
+    net: Stream = undefined, // the worker's copy stream; it stages and publishes there
     fds: [max_conns]std.c.fd_t = @splat(-1),
-    n_conns: usize = 0,
+    streams: [slots]abi.Stream = @splat(null), // a slot a stream, taken on first use (this rank's own affair)
+    n_slots: usize = 0,
     jobs: [depth]Job = undefined,
     head: std.atomic.Value(usize) = .init(0), // the worker's
     tail: std.atomic.Value(usize) = .init(0), // the caller's
-    seq: u32 = 0,
+    id: u32 = 0, // the exchange counter both ranks advance in step (the header's sequence)
+    seqs: [slots]u32 = @splat(0),
     running: std.atomic.Value(bool) = .init(true),
     failed: std.atomic.Value(bool) = .init(false),
     err: [192]u8 = @splat(0),
     thread: ?std.Thread = null,
     calls: u64 = 0,
     moved: u64 = 0,
-    stage_ns: u64 = 0,
-    net_ns: u64 = 0,
 
-    fn fail(ch: *Channel, comptime fmt: []const u8, args: anytype) void {
-        if (ch.failed.swap(true, .acq_rel)) return;
-        _ = std.fmt.bufPrint(ch.err[0 .. ch.err.len - 1], fmt, args) catch {};
-        ch.g.failed.store(true, .release); // the whole path is off; check() raises it after the engine's synchronize
-        std.log.err("TCP all-gather worker failed: {s}", .{std.mem.sliceTo(&ch.err, 0)});
+    fn fail(x: *Gather, comptime fmt: []const u8, args: anytype) void {
+        if (x.failed.swap(true, .acq_rel)) return;
+        _ = std.fmt.bufPrint(x.err[0 .. x.err.len - 1], fmt, args) catch {};
+        std.log.err("TCP all-gather failed: {s}; NCCL carries every gather from here", .{std.mem.sliceTo(&x.err, 0)});
     }
 
     /// The worker: a job at a time, in order, each staged, exchanged and published without touching the caller.
-    fn run(ch: *Channel) void {
-        const d = ch.g.d;
-        const cap = ch.g.cap;
-        // A fresh thread has no current context: every driver call below would fail with INVALID_CONTEXT.
-        if (d.api.cuCtxSetCurrent(ch.g.ctx) != abi.success) {
-            ch.fail("cuCtxSetCurrent (the worker thread)", .{});
+    fn run(x: *Gather) void {
+        const d = x.d;
+        if (d.api.cuCtxSetCurrent(x.ctx) != abi.success) { // a fresh thread has no context of its own
+            x.fail("cuCtxSetCurrent (the worker thread)", .{});
             return;
         }
         while (true) {
-            const tail = ch.tail.load(.acquire);
-            if (ch.head.load(.monotonic) == tail) {
-                if (!ch.running.load(.acquire)) return;
+            const tail = x.tail.load(.acquire);
+            if (x.head.load(.monotonic) == tail) {
+                if (!x.running.load(.acquire)) return;
                 sleepMs(50);
                 continue;
             }
-            const slot = ch.head.load(.monotonic) % depth;
-            const job = ch.jobs[slot];
-            ch.head.store(ch.head.load(.monotonic) + 1, .release);
+            const job = x.jobs[x.head.load(.monotonic) % depth];
+            x.head.store(x.head.load(.monotonic) + 1, .release);
 
-            const host = ch.host.bytes[0..job.bytes];
-            const peer = ch.host.bytes[cap .. cap + job.bytes];
-            const start = monotonicNs();
-            d.check(d.api.cuStreamWaitValue32_v2(ch.net.handle, ch.ready_dev, job.seq, wait_geq), "cuStreamWaitValue32") catch {
-                ch.fail("cuStreamWaitValue32 (ready)", .{});
+            const host = x.host.bytes[0..job.bytes];
+            const peer = x.host.bytes[x.cap .. x.cap + job.bytes];
+            d.check(d.api.cuStreamWaitValue32_v2(x.net.handle, x.flags_dev + 4 + @as(abi.DevicePtr, job.slot) * 4, job.seq, wait_geq), "cuStreamWaitValue32 (ready)") catch {
+                x.fail("cuStreamWaitValue32 (ready)", .{});
                 return;
             };
-            d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(host.ptr), job.mine, job.bytes, ch.net.handle), "cuMemcpyDtoHAsync") catch {
-                ch.fail("cuMemcpyDtoHAsync", .{});
+            d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(host.ptr), job.mine, job.bytes, x.net.handle), "cuMemcpyDtoHAsync") catch {
+                x.fail("cuMemcpyDtoHAsync", .{});
                 return;
             };
-            d.check(d.api.cuStreamSynchronize(ch.net.handle), "cuStreamSynchronize") catch {
-                ch.fail("cuStreamSynchronize (stage)", .{});
+            d.check(d.api.cuStreamSynchronize(x.net.handle), "cuStreamSynchronize (stage)") catch {
+                x.fail("cuStreamSynchronize (stage)", .{});
                 return;
             };
-            const staged = monotonicNs();
-
-            ch.exchange(job.seq, host, peer) catch |e| {
-                ch.fail("exchange: {s}", .{@errorName(e)});
+            x.exchange(job.id, host, peer) catch |e| {
+                x.fail("exchange: {s}", .{@errorName(e)});
                 return;
             };
-            const exchanged = monotonicNs();
-
-            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + ch.g.rank * job.bytes, @ptrCast(host.ptr), job.bytes, ch.net.handle), "cuMemcpyHtoDAsync (own)") catch {
-                ch.fail("cuMemcpyHtoDAsync (own)", .{});
+            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + x.rank * job.bytes, @ptrCast(host.ptr), job.bytes, x.net.handle), "cuMemcpyHtoDAsync (own)") catch {
+                x.fail("cuMemcpyHtoDAsync (own)", .{});
                 return;
             };
-            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + (1 - ch.g.rank) * job.bytes, @ptrCast(peer.ptr), job.bytes, ch.net.handle), "cuMemcpyHtoDAsync (peer)") catch {
-                ch.fail("cuMemcpyHtoDAsync (peer)", .{});
+            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + (1 - x.rank) * job.bytes, @ptrCast(peer.ptr), job.bytes, x.net.handle), "cuMemcpyHtoDAsync (peer)") catch {
+                x.fail("cuMemcpyHtoDAsync (peer)", .{});
                 return;
             };
-            d.check(d.api.cuStreamWriteValue32_v2(ch.net.handle, ch.done_dev, job.seq, write_default), "cuStreamWriteValue32 (done)") catch {
-                ch.fail("cuStreamWriteValue32 (done)", .{});
+            d.check(d.api.cuStreamWriteValue32_v2(x.net.handle, x.flags_dev, job.id, write_default), "cuStreamWriteValue32 (done)") catch {
+                x.fail("cuStreamWriteValue32 (done)", .{});
                 return;
             };
-            ch.calls += 1;
-            ch.moved += job.bytes;
-            ch.stage_ns += @intCast(staged - start);
-            ch.net_ns += @intCast(exchanged - staged);
+            x.calls += 1;
+            x.moved += job.bytes;
         }
     }
 
     /// Every connection sends its stripe and takes the peer's; the stripes tile the buffer exactly. One thread polls
-    /// every connection, so no send waits behind a full socket while the peer's send waits behind it.
-    fn exchange(ch: *Channel, seq: u32, host: []const u8, peer: []u8) !void {
+    /// every connection, so no send waits behind a full socket while the peer's send waits behind it. The wait for the
+    /// peer is a count of poll ticks (the clock is not trusted for deadlines).
+    fn exchange(x: *Gather, id: u32, host: []const u8, peer: []u8) !void {
         var stripes: [max_conns]Stripe = undefined;
-        for (0..ch.n_conns) |i| {
-            const lo = host.len * i / ch.n_conns;
-            const hi = host.len * (i + 1) / ch.n_conns;
-            stripes[i] = .{ .fd = ch.fds[i], .send_at = lo, .send_end = hi, .recv_at = lo, .recv_end = hi };
+        for (0..x.conns) |i| {
+            const lo = host.len * i / x.conns;
+            const hi = host.len * (i + 1) / x.conns;
+            stripes[i] = .{ .fd = x.fds[i], .send_at = lo, .send_end = hi, .recv_at = lo, .recv_end = hi };
         }
         var header: [header_bytes]u8 = undefined;
-        std.mem.writeInt(u64, header[0..8], seq, .big);
+        std.mem.writeInt(u64, header[0..8], id, .big);
         std.mem.writeInt(u64, header[8..16], host.len, .big);
-        const deadline = monotonicNs() + @as(i128, @intCast(ch.g.timeout_s)) * std.time.ns_per_s;
+        var ticks: u64 = 0;
         while (true) {
             var fds: [max_conns]std.c.pollfd = undefined;
             var which: [max_conns]usize = undefined;
             var n: usize = 0;
-            for (0..ch.n_conns) |i| {
+            for (0..x.conns) |i| {
                 const s = stripes[i];
                 if (!s.sending and !s.receiving) continue;
                 fds[n] = .{
@@ -258,19 +263,17 @@ const Channel = struct {
             if (n == 0) return;
             const rc = std.c.poll(@ptrCast(&fds), @intCast(n), 1000);
             if (rc < 0) return error.Setup;
-            if (!ch.running.load(.acquire)) return error.Setup;
-            if (rc == 0) { // a tick to notice a stop, and a deadline so a silent peer fails the job
-                if (monotonicNs() > deadline) return error.Setup;
-                continue;
-            }
-            if (monotonicNs() > deadline) return error.Setup;
+            if (!x.running.load(.acquire)) return error.Stopped;
+            ticks += 1;
+            if (ticks > x.timeout_s) return error.Setup; // a second a tick: the peer fell silent
+            if (rc == 0) continue;
             for (0..n) |k| {
                 const revents = fds[k].revents;
                 if (revents == 0) continue;
                 if (revents & (std.c.POLL.ERR | std.c.POLL.HUP | std.c.POLL.NVAL) != 0) return error.Setup;
                 const s = &stripes[which[k]];
-                if (s.sending) sendStep(s, &header, host) catch return error.Setup;
-                if (s.receiving) recvStep(s, seq, peer) catch return error.Setup;
+                if (s.sending) try sendStep(s, &header, host);
+                if (s.receiving) try recvStep(s, id, peer);
             }
         }
     }
@@ -291,18 +294,17 @@ const Channel = struct {
         s.sending = false;
     }
 
-    fn recvStep(s: *Stripe, seq: u32, peer: []u8) !void {
+    fn recvStep(s: *Stripe, id: u32, peer: []u8) !void {
         while (s.got_header < header_bytes) {
             const n = std.c.recv(s.fd, @ptrCast(&s.recv_header[s.got_header]), header_bytes - s.got_header, 0);
             if (n < 0) return; // not readable yet; poll again
             if (n == 0) return error.Setup;
             s.got_header += @intCast(n);
-        }
-        if (s.recv_at == s.recv_end) {
-            // the header is in: its sequence and length must be the ones this exchange posted
-            const got_seq = std.mem.readInt(u64, s.recv_header[0..8], .big);
-            const got_len = std.mem.readInt(u64, s.recv_header[8..16], .big);
-            if (got_seq != seq or got_len != peer.len) return error.Setup;
+            if (s.got_header == header_bytes) { // the header is in: it must be this exchange's
+                const got_id = std.mem.readInt(u64, s.recv_header[0..8], .big);
+                const got_len = std.mem.readInt(u64, s.recv_header[8..16], .big);
+                if (got_id != id or got_len != peer.len) return error.Setup;
+            }
         }
         while (s.recv_at < s.recv_end) {
             const n = std.c.recv(s.fd, @ptrCast(&peer[s.recv_at]), s.recv_end - s.recv_at, 0);
@@ -313,51 +315,15 @@ const Channel = struct {
         s.receiving = false;
     }
 
-    fn stop(ch: *Channel) void {
-        ch.running.store(false, .release);
-        for (0..ch.n_conns) |i| _ = std.c.shutdown(ch.fds[i], std.c.SHUT.RDWR);
-    }
-
-    fn deinit(ch: *Channel, gpa: std.mem.Allocator) void {
-        ch.stop();
-        if (ch.thread) |t| t.join();
-        for (0..ch.n_conns) |i| closeFd(ch.fds[i]);
-        ch.net.deinit();
-        ch.flags.free();
-        ch.host.free();
-        gpa.destroy(ch);
-    }
-};
-
-/// A rank's TCP all-gather path: one channel a stream, plus the handshake both ranks ran.
-pub const Gather = struct {
-    d: *const Driver,
-    gpa: std.mem.Allocator,
-    group: *const tp_group.Group,
-    rank: u32,
-    cap: usize,
-    min_bytes: usize,
-    conns: usize,
-    port: u16,
-    timeout_s: u64,
-    rails: [max_rails]u32 = @splat(0),
-    peer_rails: [max_rails]u32 = @splat(0),
-    n_rails: usize = 0,
-    ctx: abi.Context = null, // the engine thread's context; a worker thread must set it before any driver call
-    channels: [max_channels]?*Channel = @splat(null),
-    n_channels: std.atomic.Value(usize) = .init(0),
-    failed: std.atomic.Value(bool) = .init(false),
-    err: [192]u8 = @splat(0),
-
     /// Both ranks call it; null when either did not ask, when the addresses are missing, or when the pair disagreed.
     pub fn open(gpa: std.mem.Allocator, d: *const Driver, group: *const tp_group.Group, s: Stream) !?*Gather {
+        if (group.world != 2 or !wanted()) return null;
+        const x = try gpa.create(Gather);
+        var keep = false;
+        defer if (!keep) gpa.destroy(x);
         const min_bytes = std.math.clamp(envInt("TF_TCP_GATHER_MIN_KB", 2048), 16, 1 << 20) << 10;
         const max_bytes = std.math.clamp(envInt("TF_TCP_GATHER_MAX_KB", 32768), 16, 1 << 20) << 10;
-        if (group.world != 2 or !wanted()) return null;
-        const self = try gpa.create(Gather);
-        var keep = false;
-        defer if (!keep) gpa.destroy(self);
-        self.* = .{
+        x.* = .{
             .d = d,
             .gpa = gpa,
             .group = group,
@@ -365,17 +331,17 @@ pub const Gather = struct {
             .cap = max_bytes / 16 * 16,
             .min_bytes = min_bytes / 16 * 16,
             .conns = std.math.clamp(envInt("TF_TCP_GATHER_CONNS", 8), 1, max_conns),
-            .port = @intCast(std.math.clamp(envInt("TF_TCP_GATHER_PORT", 30680), 1024, 65535 - max_channels * max_conns)),
+            .port = @intCast(std.math.clamp(envInt("TF_TCP_GATHER_PORT", 30680), 1024, 65535 - max_conns)),
             .timeout_s = std.math.clamp(envInt("TF_TCP_GATHER_TIMEOUT_S", 60), 1, 3600),
         };
-        if (d.api.cuCtxGetCurrent(&self.ctx) != abi.success) return error.Setup; // the worker sets it current
-        self.n_rails = parseRails("TF_TCP_GATHER_RAILS", &self.rails) catch return error.BadConfig;
-        const peer_n = parseRails("TF_TCP_GATHER_PEER_RAILS", &self.peer_rails) catch return error.BadConfig;
-        if (peer_n != self.n_rails) return error.BadConfig;
-        if (self.cap == 0 or self.cap < self.min_bytes) return null;
+        if (d.api.cuCtxGetCurrent(&x.ctx) != abi.success) return error.Setup; // the worker sets it current
+        x.n_rails = parseRails("TF_TCP_GATHER_RAILS", &x.rails) catch return error.BadConfig;
+        const peer_n = parseRails("TF_TCP_GATHER_PEER_RAILS", &x.peer_rails) catch return error.BadConfig;
+        if (peer_n != x.n_rails) return error.BadConfig;
+        if (x.cap == 0 or x.cap < x.min_bytes) return null;
 
         // Both ranks must want it and agree on one range; the size alone then decides the path on both sides.
-        const mine: u64 = @as(u64, @intCast(self.min_bytes >> 10)) | (@as(u64, @intCast(self.cap >> 10)) << 32);
+        const mine: u64 = @as(u64, @intCast(x.min_bytes >> 10)) | (@as(u64, @intCast(x.cap >> 10)) << 32);
         var both: [2]u64 = undefined;
         group.gather(u64, d, s, mine, &both) catch |e| {
             std.log.warn("TCP all-gather: handshake failed ({s}); NCCL carries every gather", .{@errorName(e)});
@@ -383,82 +349,113 @@ pub const Gather = struct {
         };
         const theirs = both[1 - group.rank];
         if (theirs == 0) return null;
-        self.min_bytes = @max(self.min_bytes, @as(usize, @intCast(theirs & 0xFFFF_FFFF)) << 10);
-        self.cap = @min(self.cap, @as(usize, @intCast(theirs >> 32)) << 10);
-        if (self.cap < self.min_bytes) return null;
-        keep = true;
-        std.log.info("TCP all-gather: {d} rail(s), {d} connection(s), shards {d}-{d} KiB over the rails", .{ self.n_rails, self.conns, self.min_bytes >> 10, self.cap >> 10 });
-        return self;
-    }
+        x.min_bytes = @max(x.min_bytes, @as(usize, @intCast(theirs & 0xFFFF_FFFF)) << 10);
+        x.cap = @min(x.cap, @as(usize, @intCast(theirs >> 32)) << 10);
+        if (x.cap < x.min_bytes) return null;
 
-    /// Whether a gather of `bytes` on `s` goes this way: the size and the stream table decide, both the same on the
-    /// two ranks (they run the same forward, so their streams and call order agree).
-    pub fn fits(x: *const Gather, s: abi.Stream, bytes: usize) bool {
-        if (x.failed.load(.acquire)) return false;
-        if (bytes < x.min_bytes or bytes > x.cap or bytes % 16 != 0) return false;
-        const n = x.n_channels.load(.acquire);
-        for (x.channels[0..n]) |maybe| if (maybe) |ch| if (ch.stream == s) return true;
-        return n < max_channels; // room for the channel this stream's first large gather would open
-    }
-
-    /// The channel for `s`, made on first use (both ranks reach the same call sites in the same order).
-    fn channel(x: *Gather, s: abi.Stream) !*Channel {
-        const n = x.n_channels.load(.acquire);
-        for (x.channels[0..n]) |maybe| if (maybe) |ch| if (ch.stream == s) return ch;
-        if (n == max_channels) return error.Setup;
-        // The index is agreed with the peer before any socket exists, so both ranks bind the same port block.
-        var agreed: [2]u32 = undefined;
-        x.group.gather(u32, x.d, Stream.borrowed(x.d, s), @intCast(n), &agreed) catch return error.Setup;
-        if (agreed[0] != n or agreed[1] != n) return error.Setup;
-        const ch = try openChannel(x, n, s);
-        x.channels[n] = ch;
-        x.n_channels.store(n + 1, .release);
-        return ch;
-    }
-
-    fn openChannel(x: *Gather, index: usize, s: abi.Stream) !*Channel {
-        const ch = try x.gpa.create(Channel);
-        errdefer x.gpa.destroy(ch);
-        ch.* = .{ .g = x, .index = index, .stream = s, .host = undefined, .flags = undefined, .net = undefined };
-        ch.host = try memory.HostBuffer.allocMapped(x.d, 2 * x.cap);
-        errdefer ch.host.free();
-        @memset(ch.host.bytes, 0);
-        ch.flags = try memory.HostBuffer.allocMapped(x.d, 4096);
-        errdefer ch.flags.free();
-        @memset(ch.flags.bytes, 0);
-        ch.ready_dev = try ch.flags.device();
-        ch.done_dev = ch.ready_dev + 4;
-        ch.net = try Stream.init(x.d, true);
-        errdefer ch.net.deinit();
-        ch.n_conns = x.conns;
+        // The buffers, the copy stream, the sockets: one set for every stream.
+        x.host = memory.HostBuffer.allocMapped(d, 2 * x.cap) catch return error.Setup;
+        @memset(x.host.bytes, 0);
+        x.flags = memory.HostBuffer.allocMapped(d, 4096) catch {
+            x.host.free();
+            return error.Setup;
+        };
+        @memset(x.flags.bytes, 0);
+        x.flags_dev = x.flags.device() catch {
+            x.flags.free();
+            x.host.free();
+            return error.Setup;
+        };
+        x.host_dev = 0;
+        x.net = Stream.init(d, true) catch {
+            x.flags.free();
+            x.host.free();
+            return error.Setup;
+        };
         var ok: u32 = 1;
-        connect(ch) catch {
+        x.connect() catch {
             ok = 0;
         };
 
-        // Both ranks say whether they connected; one failure turns the path off on both (fits returns false, so every
-        // later gather stays on NCCL) and fails this one call the same way on both.
+        // Both ranks say whether they connected; one failure turns the path off on both and every later gather,
+        // this one's included, takes NCCL instead (the error below is raised the same way on both ranks).
         var both_ok: [2]u32 = undefined;
-        x.group.gather(u32, x.d, Stream.borrowed(x.d, s), ok, &both_ok) catch {
-            x.failed.store(true, .release);
+        group.gather(u32, d, s, ok, &both_ok) catch {
+            x.fail("the connected handshake did not cross", .{});
+            x.teardownSockets();
+            x.net.deinit();
+            x.flags.free();
+            x.host.free();
             return error.Setup;
         };
         if (both_ok[0] != 1 or both_ok[1] != 1) {
-            x.failed.store(true, .release);
-            for (0..ch.n_conns) |i| closeFd(ch.fds[i]);
             std.log.warn("TCP all-gather: the rails' sockets did not open on both ranks; NCCL carries every gather", .{});
-            return error.Setup;
+            x.teardownSockets();
+            x.net.deinit();
+            x.flags.free();
+            x.host.free();
+            return null; // agreed: the path is simply not there (fits stays false; nothing failed)
         }
-        ch.thread = try std.Thread.spawn(.{}, Channel.run, .{ch});
-        return ch;
+        x.thread = std.Thread.spawn(.{}, run, .{x}) catch {
+            x.teardownSockets();
+            x.net.deinit();
+            x.flags.free();
+            x.host.free();
+            return error.Setup;
+        };
+        keep = true;
+        std.log.info("TCP all-gather: {d} rail(s), {d} connection(s), shards {d}-{d} KiB over the rails", .{ x.n_rails, x.conns, x.min_bytes >> 10, x.cap >> 10 });
+        return x;
+    }
+
+    /// Whether a gather of `bytes` goes this way: the size alone decides, so both ranks take one path.
+    pub fn fits(x: *const Gather, bytes: usize) bool {
+        if (x.failed.load(.acquire)) return false;
+        return bytes >= x.min_bytes and bytes <= x.cap and bytes % 16 == 0;
+    }
+
+    /// This stream's slot, taken on first use; the peer never sees it (the exchange pairs by issue order alone).
+    fn slotFor(x: *Gather, s: abi.Stream) Error!u5 {
+        for (x.streams, 0..) |known, i| if (known == s) return @intCast(i);
+        if (x.n_slots == slots) return error.Setup;
+        const taken = x.n_slots;
+        x.streams[taken] = s;
+        x.n_slots += 1;
+        return @intCast(taken);
+    }
+
+    /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather), on `s`.
+    pub fn gather(x: *Gather, s: abi.Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) Error!void {
+        if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
+        if (x.failed.load(.acquire)) return error.ProxyFailed;
+        const slot = try x.slotFor(s);
+        while (x.tail.load(.acquire) - x.head.load(.acquire) == depth) {
+            if (x.failed.load(.acquire)) return error.ProxyFailed;
+            sleepMs(20);
+        }
+        x.id +%= 1;
+        if (x.id == 0) x.id = 1; // 0 is every flag word's initial value
+        x.seqs[slot] +%= 1;
+        if (x.seqs[slot] == 0) x.seqs[slot] = 1;
+        x.jobs[x.tail.load(.monotonic) % depth] = .{ .mine = mine, .all = all, .bytes = bytes, .id = x.id, .slot = slot, .seq = x.seqs[slot] };
+        x.tail.store(x.tail.load(.monotonic) + 1, .release);
+        // The producer before the copy (this rank's ready word), the caller's stream after the gather (the done word);
+        // every value only grows, so the stream's wait is satisfied only by this job's own completion.
+        x.d.check(x.d.api.cuStreamWriteValue32_v2(s, x.flags_dev + 4 + @as(abi.DevicePtr, slot) * 4, x.seqs[slot], write_default), "cuStreamWriteValue32") catch return error.Setup;
+        x.d.check(x.d.api.cuStreamWaitValue32_v2(s, x.flags_dev, x.id, wait_geq), "cuStreamWaitValue32") catch return error.Setup;
+    }
+
+    /// An error if the worker gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
+    pub fn check(x: *Gather) !void {
+        if (!x.failed.load(.acquire)) return;
+        return error.ProxyFailed;
     }
 
     /// The connections, one stripe a connection, `i % rails`; rank 0 listens, rank 1 dials.
-    fn connect(ch: *Channel) !void {
-        const x = ch.g;
-        for (0..ch.n_conns) |i| {
+    fn connect(x: *Gather) !void {
+        for (0..x.conns) |i| {
             const rail = i % x.n_rails;
-            const port: u16 = @intCast(x.port + ch.index * max_conns + i);
+            const port: u16 = @intCast(x.port + i);
             const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
             if (fd < 0) return error.Setup;
             setTimeouts(fd, x.timeout_s);
@@ -475,9 +472,9 @@ pub const Gather = struct {
                     closeFd(fd);
                     return error.Setup;
                 }
-                setNonBlocking(fd); // a peer that never connects must not hang the engine: poll with a deadline
+                setNonBlocking(fd); // a peer that never connects must not hang the engine: poll with a tick budget
                 var pfd: std.c.pollfd = .{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 };
-                const deadline = monotonicNs() + @as(i128, @intCast(x.timeout_s)) * std.time.ns_per_s;
+                var ticks: u64 = 0;
                 while (true) {
                     const rc = std.c.poll(@ptrCast(&pfd), 1, 1000);
                     if (rc < 0) {
@@ -485,7 +482,8 @@ pub const Gather = struct {
                         return error.Setup;
                     }
                     if (rc > 0 and pfd.revents != 0) break;
-                    if (monotonicNs() > deadline) {
+                    ticks += 1;
+                    if (ticks > x.timeout_s) {
                         closeFd(fd);
                         return error.Setup;
                     }
@@ -500,75 +498,53 @@ pub const Gather = struct {
                     return error.Setup;
                 }
                 setNonBlocking(cfd);
-                ch.fds[i] = cfd;
+                x.fds[i] = cfd;
             } else {
                 var peer_addr = ipv4(x.peer_rails[rail]);
                 peer_addr.port = std.mem.nativeToBig(u16, port);
-                const deadline = monotonicNs() + @as(i128, @intCast(x.timeout_s)) * std.time.ns_per_s;
+                const deadline_ticks: u64 = x.timeout_s;
+                var ticks: u64 = 0;
                 while (true) {
                     if (std.c.connect(fd, @ptrCast(&peer_addr), @sizeOf(std.c.sockaddr.in)) == 0) break;
-                    if (monotonicNs() > deadline) {
+                    ticks += 1;
+                    if (ticks > deadline_ticks) {
                         closeFd(fd);
                         return error.Setup;
                     }
-                    sleepMs(100);
+                    sleepMs(1000);
                 }
                 setNonBlocking(fd);
-                ch.fds[i] = fd;
+                x.fds[i] = fd;
             }
         }
     }
 
-    /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather), on `s`.
-    pub fn gather(x: *Gather, s: abi.Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) Error!void {
-        if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
-        if (x.failed.load(.acquire)) return error.ProxyFailed;
-        const ch = x.channel(s) catch return error.Setup;
-        if (ch.failed.load(.acquire)) return error.ProxyFailed;
-        while (ch.tail.load(.acquire) - ch.head.load(.acquire) == depth) {
-            if (ch.failed.load(.acquire)) return error.ProxyFailed;
-            sleepMs(20);
+    fn teardownSockets(x: *Gather) void {
+        for (0..x.conns) |i| {
+            _ = std.c.shutdown(x.fds[i], std.c.SHUT.RDWR);
+            closeFd(x.fds[i]);
+            x.fds[i] = -1;
         }
-        ch.seq +%= 1;
-        if (ch.seq == 0) ch.seq = 1; // 0 is the flag words' initial value
-        const seq = ch.seq;
-        ch.jobs[ch.tail.load(.monotonic) % depth] = .{ .mine = mine, .all = all, .bytes = bytes, .seq = seq };
-        ch.tail.store(ch.tail.load(.monotonic) + 1, .release);
-        // The producer before the copy, the caller's stream after the gather; both values only grow.
-        x.d.check(x.d.api.cuStreamWriteValue32_v2(s, ch.ready_dev, seq, write_default), "cuStreamWriteValue32") catch return error.Setup;
-        x.d.check(x.d.api.cuStreamWaitValue32_v2(s, ch.done_dev, seq, wait_geq), "cuStreamWaitValue32") catch return error.Setup;
-    }
-
-    /// An error if a worker gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
-    pub fn check(x: *Gather) !void {
-        if (!x.failed.load(.acquire)) return;
-        var what: []const u8 = std.mem.sliceTo(&x.err, 0);
-        const n = x.n_channels.load(.acquire);
-        for (x.channels[0..n]) |maybe| if (maybe) |ch| {
-            if (ch.failed.load(.acquire) and what.len == 0) what = std.mem.sliceTo(&ch.err, 0);
-        };
-        std.log.err("TCP all-gather failed: {s}", .{what});
-        return error.ProxyFailed;
     }
 
     pub fn abort(x: *Gather) void {
-        for (x.channels[0..x.n_channels.load(.acquire)]) |maybe| if (maybe) |ch| ch.stop();
+        x.running.store(false, .release);
+        x.teardownSockets();
     }
 
     pub fn deinit(x: *Gather) void {
         x.abort();
-        for (x.channels[0..x.n_channels.load(.acquire)]) |maybe| if (maybe) |ch| ch.deinit(x.gpa);
+        if (x.thread) |t| t.join();
+        x.net.deinit();
+        x.flags.free();
+        x.host.free();
         x.gpa.destroy(x);
     }
 
     /// Bytes and calls so far (for the line the engine logs when the run stops).
     pub fn totals(x: *Gather, moved: *u64, calls: *u64) void {
-        moved.* = 0;
-        calls.* = 0;
-        for (x.channels[0..x.n_channels.load(.acquire)]) |maybe| if (maybe) |ch| {
-            moved.* += ch.moved;
-            calls.* += ch.calls;
-        };
+        moved.* = x.moved;
+        calls.* = x.calls;
     }
 };
 
@@ -582,28 +558,28 @@ test "TCP all-gather: addresses parse as dotted quads" {
 test "TCP all-gather: a size decides the path, and the range is inclusive" {
     var x: Gather = undefined;
     x.failed = .init(false);
-    x.channels = @splat(null);
-    x.n_channels = .init(0);
     x.min_bytes = 2 << 20;
     x.cap = 32 << 20;
-    try std.testing.expect(!Gather.fits(&x, null, 1 << 20));
-    try std.testing.expect(Gather.fits(&x, null, 2 << 20)); // room for a channel
-    try std.testing.expect(Gather.fits(&x, null, 32 << 20));
-    try std.testing.expect(!Gather.fits(&x, null, (32 << 20) + 16));
-    var fake: Channel = undefined; // fits reads the stream handle alone
-    fake.stream = @ptrFromInt(0x1002);
-    x.channels[0] = &fake;
-    x.n_channels.store(1, .release);
-    try std.testing.expect(Gather.fits(&x, @ptrFromInt(0x1002), 4 << 20)); // a known stream always fits
-    var i: usize = 1;
-    while (i + 1 < max_channels) : (i += 1) { // the table filling: an unknown stream fits while there is room
-        x.channels[i] = null;
-        x.n_channels.store(i + 1, .release);
-        try std.testing.expect(Gather.fits(&x, @ptrFromInt(0x1000 + i), 4 << 20));
-    }
-    x.channels[max_channels - 1] = null;
-    x.n_channels.store(max_channels, .release);
-    try std.testing.expect(!Gather.fits(&x, @ptrFromInt(0x9000), 4 << 20)); // full: a new stream stays on NCCL
+    try std.testing.expect(!Gather.fits(&x, 1 << 20));
+    try std.testing.expect(Gather.fits(&x, 2 << 20));
+    try std.testing.expect(Gather.fits(&x, 32 << 20));
+    try std.testing.expect(!Gather.fits(&x, (32 << 20) + 16));
     x.failed.store(true, .release);
-    try std.testing.expect(!Gather.fits(&x, null, 4 << 20));
+    try std.testing.expect(!Gather.fits(&x, 4 << 20));
+}
+
+test "TCP all-gather: a stream takes a slot once, and the table refuses past its end" {
+    var x: Gather = undefined;
+    x.streams = @splat(null);
+    x.n_slots = 0;
+    const a = try Gather.slotFor(&x, @ptrFromInt(0x1000));
+    const b = try Gather.slotFor(&x, @ptrFromInt(0x2000));
+    const a2 = try Gather.slotFor(&x, @ptrFromInt(0x1000));
+    try std.testing.expectEqual(@as(u5, 0), a);
+    try std.testing.expectEqual(@as(u5, 1), b);
+    try std.testing.expectEqual(a, a2);
+    while (x.n_slots < slots) {
+        _ = Gather.slotFor(&x, @ptrFromInt(0x3000 + x.n_slots)) catch return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.Setup, Gather.slotFor(&x, @ptrFromInt(0x9000)));
 }
