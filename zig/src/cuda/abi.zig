@@ -208,6 +208,8 @@ pub const Api = struct {
     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
+    cuStreamWaitValue32_v2: *const fn (Stream, DevicePtr, u32, c_uint) callconv(.c) R,
+    cuStreamWriteValue32_v2: *const fn (Stream, DevicePtr, u32, c_uint) callconv(.c) R,
     cuStreamQuery: *const fn (Stream) callconv(.c) R,
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,

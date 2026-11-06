@@ -277,6 +277,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         own.e.drafter = try dflash_load.load(gpa, io, own.e, dd, p.rank, p.world, o.drafter_bits);
     }
     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
+    own.group.openTcp(gpa, ctx.d, own.e.stream); // no verbs device: large gathers over the rails (both ranks or neither)
     errdefer if (own.group.fast) |f| f.deinit();
     try @import("cuda_p2p.zig").open(gpa, ctx.d, &own.group, own.e.stream, own.e.m.glue.p2p_gather); // both ranks, or neither
     errdefer if (own.group.p2p) |x| {

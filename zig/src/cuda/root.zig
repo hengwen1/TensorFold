@@ -57,6 +57,7 @@ pub const relay_plan = @import("relay_plan.zig");
 pub const tp_group = @import("tp_group.zig");
 pub const ce_push = @import("ce_push.zig");
 pub const p2p_gather = @import("p2p_gather.zig");
+pub const tcp_gather = @import("tcp_gather.zig");
 pub const tp_watch = @import("tp_watch.zig");
 pub const p2p_report = @import("p2p_report.zig");
 pub const ck = @import("ck.zig");
@@ -105,6 +106,7 @@ test {
     _ = @import("sample.zig");
     _ = @import("roce.zig");
     _ = @import("p2p_gather.zig");
+    _ = @import("tcp_gather.zig");
     _ = @import("ce_push.zig");
     _ = @import("roce_nap.zig");
     _ = @import("rank_scatter.zig");

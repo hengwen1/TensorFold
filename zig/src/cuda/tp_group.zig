@@ -1,5 +1,6 @@
 //! A tensor-parallel group over NCCL (NCCL_COMM_ID; rows in rank order); two ranks add RoCE small gathers (roce.zig).
 const std = @import("std");
+const abi = @import("abi.zig");
 const nccl = @import("nccl.zig");
 const driver = @import("driver.zig");
 const stream_ = @import("stream.zig");
@@ -7,6 +8,7 @@ const memory = @import("memory.zig");
 const roce = @import("roce.zig");
 const p2p_report = @import("p2p_report.zig");
 const p2p_gather = @import("p2p_gather.zig");
+const tcp_gather = @import("tcp_gather.zig");
 const Function = @import("module.zig").Function;
 
 const Stream = stream_.Stream;
@@ -19,6 +21,7 @@ pub const Group = struct {
     aborted: std.atomic.Value(bool) = .init(false),
     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
     p2p: ?*p2p_gather.Gather = null, // two ranks on one host: one stream's small all-gathers by peer stores (openP2p)
+    tcp: ?*tcp_gather.Gather = null, // two hosts without verbs: large all-gathers over the rails' TCP sockets (openTcp)
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
     pub fn open(d: *const driver.Driver, rank: usize, world: usize) !Group {
@@ -38,6 +41,7 @@ pub const Group = struct {
 
     pub fn close(g: *Group) void {
         p2p_report.ready(); // a transport line still owed is reported before the communicator goes
+        if (g.tcp) |t| t.deinit();
         if (g.p2p) |p| p.deinit();
         if (g.fast) |f| f.deinit();
         g.destroyComm();
@@ -50,6 +54,7 @@ pub const Group = struct {
     }
 
     pub fn abort(g: *Group) void {
+        if (g.tcp) |t| t.abort(); // a TCP exchange still waiting gives up too
         if (g.p2p) |p| p.abort(); // a peer-store gather still waiting gives up too
         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
     }
@@ -66,8 +71,23 @@ pub const Group = struct {
         g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
     }
 
+    /// Two hosts with no verbs device: gathers of `min`..`max` bytes go over the rails' TCP sockets (both ranks or neither).
+    pub fn openTcp(g: *Group, gpa: std.mem.Allocator, d: *const driver.Driver, s: Stream) void {
+        if (g.world != 2 or g.tcp != null) return;
+        g.tcp = tcp_gather.Gather.open(gpa, d, g, s) catch |e| blk: {
+            std.log.warn("TCP all-gather: {s}; NCCL carries every gather", .{@errorName(e)});
+            break :blk null;
+        };
+    }
+
+    /// Whether a gather of `bytes` on `s` would take the TCP path (the size alone decides, so both ranks agree).
+    pub fn tcpFits(g: *const Group, s: abi.Stream, bytes: usize) bool {
+        return if (g.tcp) |t| t.fits(s, bytes) else false;
+    }
+
     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
     pub fn check(g: *const Group) !void {
+        if (g.tcp) |t| try t.check();
         if (g.p2p) |p| try p.check();
         if (g.fast) |f| try f.check();
     }
@@ -76,6 +96,7 @@ pub const Group = struct {
     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
         if (g.p2p) |p| if (p.fits(s.handle, bytes)) return p.gather(s, mine, all, bytes);
         if (g.fast) |f| if (f.fits(bytes)) return f.gather(s.handle, mine, all, bytes);
+        if (g.tcp) |t| if (t.fits(s.handle, bytes)) return t.gather(s.handle, mine, all, bytes);
         try g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
     }
 
