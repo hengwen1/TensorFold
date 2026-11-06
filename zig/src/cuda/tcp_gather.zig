@@ -264,9 +264,12 @@ pub const Gather = struct {
             const rc = std.c.poll(@ptrCast(&fds), @intCast(n), 1000);
             if (rc < 0) return error.Setup;
             if (!x.running.load(.acquire)) return error.Stopped;
-            ticks += 1;
-            if (ticks > x.timeout_s) return error.Setup; // a second a tick: the peer fell silent
-            if (rc == 0) continue;
+            if (rc == 0) { // idle: a second a tick. Progress resets the budget, so a busy exchange never times out.
+                ticks += 1;
+                if (ticks > x.timeout_s) return error.Setup;
+                continue;
+            }
+            ticks = 0;
             for (0..n) |k| {
                 const revents = fds[k].revents;
                 if (revents == 0) continue;
@@ -303,7 +306,10 @@ pub const Gather = struct {
             if (s.got_header == header_bytes) { // the header is in: it must be this exchange's
                 const got_id = std.mem.readInt(u64, s.recv_header[0..8], .big);
                 const got_len = std.mem.readInt(u64, s.recv_header[8..16], .big);
-                if (got_id != id or got_len != peer.len) return error.Setup;
+                if (got_id != id or got_len != peer.len) {
+                    std.log.err("TCP all-gather: stripe {d} on connection {d} got exchange {d} of {d} bytes, wanted {d} of {d}", .{ s.send_end - s.send_at, s.fd, got_id, got_len, id, peer.len });
+                    return error.Setup;
+                }
             }
         }
         while (s.recv_at < s.recv_end) {
