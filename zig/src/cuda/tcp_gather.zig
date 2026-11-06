@@ -46,6 +46,12 @@ pub fn wanted() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// TF_TCP_GATHER_DEBUG=1: every job enqueued and finished, every worker step (the log a hang is read from).
+fn debugOn() bool {
+    const v = std.c.getenv("TF_TCP_GATHER_DEBUG") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 fn envInt(comptime name: [:0]const u8, default: usize) usize {
     const v = std.c.getenv(name) orelse return default;
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
@@ -142,7 +148,7 @@ const Job = struct {
 pub const Gather = struct {
     d: *const Driver,
     gpa: std.mem.Allocator,
-    group: *const tp_group.Group,
+    group: *tp_group.Group, // abort() on a failure needs it mutable (the engine's own group)
     rank: u32,
     cap: usize,
     min_bytes: usize,
@@ -172,11 +178,18 @@ pub const Gather = struct {
     thread: ?std.Thread = null,
     calls: u64 = 0,
     moved: u64 = 0,
+    debug: bool = false,
 
+    /// A failed exchange. The engine's stream is waiting on this job's done word, so writing it (garbage rows) and
+    /// aborting the communicator is the only way this ends loudly instead of hanging: the rank stops with the error.
     fn fail(x: *Gather, comptime fmt: []const u8, args: anytype) void {
         if (x.failed.swap(true, .acq_rel)) return;
         _ = std.fmt.bufPrint(x.err[0 .. x.err.len - 1], fmt, args) catch {};
-        std.log.err("TCP all-gather failed: {s}; NCCL carries every gather from here", .{std.mem.sliceTo(&x.err, 0)});
+        std.log.err("TCP all-gather failed: {s}", .{std.mem.sliceTo(&x.err, 0)});
+        // Release a stream blocked on the job in flight, then take the communicator down: the rank stops with this
+        // error (a gather that did not complete must not look like one that did).
+        if (x.id != 0) _ = x.d.api.cuStreamWriteValue32_v2(x.net.handle, x.flags_dev, x.id, write_default);
+        x.group.abort();
     }
 
     /// The worker: a job at a time, in order, each staged, exchanged and published without touching the caller.
@@ -186,15 +199,20 @@ pub const Gather = struct {
             x.fail("cuCtxSetCurrent (the worker thread)", .{});
             return;
         }
+        if (x.debug) std.log.info("tcp-gather: worker up, {d} connection(s), cap {d} KiB", .{ x.conns, x.cap >> 10 });
         while (true) {
             const tail = x.tail.load(.acquire);
             if (x.head.load(.monotonic) == tail) {
-                if (!x.running.load(.acquire)) return;
+                if (!x.running.load(.acquire)) {
+                    if (x.debug) std.log.info("tcp-gather: worker stops (abort), {d} job(s) served", .{x.calls});
+                    return;
+                }
                 sleepMs(50);
                 continue;
             }
             const job = x.jobs[x.head.load(.monotonic) % depth];
             x.head.store(x.head.load(.monotonic) + 1, .release);
+            if (x.debug) std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}", .{ job.id, job.bytes >> 10, job.slot, job.seq });
 
             const host = x.host.bytes[0..job.bytes];
             const peer = x.host.bytes[x.cap .. x.cap + job.bytes];
@@ -228,6 +246,7 @@ pub const Gather = struct {
             };
             x.calls += 1;
             x.moved += job.bytes;
+            if (x.debug) std.log.info("tcp-gather: job {d} done", .{job.id});
         }
     }
 
@@ -322,7 +341,7 @@ pub const Gather = struct {
     }
 
     /// Both ranks call it; null when either did not ask, when the addresses are missing, or when the pair disagreed.
-    pub fn open(gpa: std.mem.Allocator, d: *const Driver, group: *const tp_group.Group, s: Stream) !?*Gather {
+    pub fn open(gpa: std.mem.Allocator, d: *const Driver, group: *tp_group.Group, s: Stream) !?*Gather {
         if (group.world != 2 or !wanted()) return null;
         const x = try gpa.create(Gather);
         var keep = false;
@@ -339,6 +358,7 @@ pub const Gather = struct {
             .conns = std.math.clamp(envInt("TF_TCP_GATHER_CONNS", 8), 1, max_conns),
             .port = @intCast(std.math.clamp(envInt("TF_TCP_GATHER_PORT", 30680), 1024, 65535 - max_conns)),
             .timeout_s = std.math.clamp(envInt("TF_TCP_GATHER_TIMEOUT_S", 60), 1, 3600),
+            .debug = debugOn(),
         };
         if (d.api.cuCtxGetCurrent(&x.ctx) != abi.success) return error.Setup; // the worker sets it current
         x.n_rails = parseRails("TF_TCP_GATHER_RAILS", &x.rails) catch return error.BadConfig;
@@ -444,11 +464,13 @@ pub const Gather = struct {
         x.seqs[slot] +%= 1;
         if (x.seqs[slot] == 0) x.seqs[slot] = 1;
         x.jobs[x.tail.load(.monotonic) % depth] = .{ .mine = mine, .all = all, .bytes = bytes, .id = x.id, .slot = slot, .seq = x.seqs[slot] };
+        if (x.debug) std.log.info("tcp-gather: enqueue {d} ({d} KiB, slot {d})", .{ x.id, bytes >> 10, slot });
         x.tail.store(x.tail.load(.monotonic) + 1, .release);
         // The producer before the copy (this rank's ready word), the caller's stream after the gather (the done word);
         // every value only grows, so the stream's wait is satisfied only by this job's own completion.
         x.d.check(x.d.api.cuStreamWriteValue32_v2(s, x.flags_dev + 4 + @as(abi.DevicePtr, slot) * 4, x.seqs[slot], write_default), "cuStreamWriteValue32") catch return error.Setup;
         x.d.check(x.d.api.cuStreamWaitValue32_v2(s, x.flags_dev, x.id, wait_geq), "cuStreamWaitValue32") catch return error.Setup;
+        if (x.debug) std.log.info("tcp-gather: queued {d}", .{x.id});
     }
 
     /// An error if the worker gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
