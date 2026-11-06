@@ -27,6 +27,7 @@ const Loader = struct {
     pk: *const q4.Kernels,
     qraw: *cuda.DeviceBuffer, // a 4-bit linear's MLX words, scales and biases before tiling
     bits: u8,
+    q32: bool = false, // TF_GLM_DFLASH2_Q32: the linears at 32 groups (the reference engine's granularity)
     stream: cuda.Stream,
     at: u64 = 0,
 
@@ -58,11 +59,23 @@ const Loader = struct {
         return p;
     }
 
-    /// `names` stacked as linear(), at the drafter's bits: quantize4 then q4's tiling, or glm_mm's.
+    /// `names` stacked as linear(), at the drafter's bits: quantize4 then q4's tiling, or glm_mm's; at 32
+    /// groups with TF_GLM_DFLASH2_Q32=1 (the reference engine's granularity; the GS 32 pack and kernel).
     fn linear(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !df.Lin {
         if (l.bits == 0) return .{ .bf16 = try l.linearB(names, rows, kk, part) };
         const n = try l.stack(names, rows, kk, part);
         const k = if (part) |p| p[3] else kk;
+        if (l.q32) {
+            const sz = q4.bytes(n, k);
+            const words = l.qraw.ptr;
+            const scales = words + std.mem.alignForward(u64, n * k / 2, 256);
+            const biases = scales + std.mem.alignForward(u64, n * k / 16, 256);
+            try quant.q4g32(l.qk, l.stream, l.tmp.ptr, n, k, words, scales, biases);
+            const q: q4.Q4 = .{ .w = try l.take(sz[0]), .s = try l.take(sz[1] * 2), .b = try l.take(sz[2] * 2), .n = n, .k = k, .npad = q4.npadOf(n) };
+            try q4.pack32(l.pk, l.stream, words, scales, biases, q);
+            try l.stream.synchronize(); // tmp and raw are reused by the next linear
+            return .{ .q4g32 = q };
+        }
         const sz = q4.bytes(n, k);
         const words = l.qraw.ptr;
         const scales = words + std.mem.alignForward(u64, n * k / 2, 256);
@@ -108,6 +121,11 @@ const Loader = struct {
     }
 };
 
+fn q32env() bool {
+    const v = std.c.getenv("TF_GLM_DFLASH2_Q32") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
     return std.fmt.bufPrint(b, "layers.{d}.{s}", .{ li, s });
 }
@@ -117,7 +135,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     if (bits != 0 and bits != 4) return error.BadDrafterBits;
     try checkConfig(gpa, io, dir);
     const d = e.d;
-    const head = (e.w.mtp orelse return error.DrafterNeedsDraftHead).draft;
+    const head = e.w.draft_head orelse return error.DrafterNeedsDraftHead; // borrowed: the weights own it
     const path = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
     defer gpa.free(path);
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -145,7 +163,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     const small: u64 = 6 * 4096 * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
     const lin_elems: u64 = df.QKV * D + 2 * KVW * D + D * D + 2 * ff * D + 2 * KVW * D + 5 * D * D / df.LAYERS;
-    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+    const q32 = q32env();
+    const gextra: u64 = if (q32) lin_elems / 16 else 0; // the 32 groups' second half of scales and biases
+    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + gextra + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
     var wbuf = try cuda.DeviceBuffer.alloc(d, total);
     errdefer wbuf.free();
     var tmp = try cuda.DeviceBuffer.alloc(d, 2 * FF * D * 2); // the largest linear as stored
@@ -154,7 +174,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     defer raw.free();
     var module = try cuda.Module.load(d, cuda.kernels.glm_dflash);
     errdefer module.unload();
-    var l: Loader = .{ .gpa = gpa, .io = io, .file = file, .ents = &ents, .w = &wbuf, .tmp = &tmp, .mk = &e.m.mm, .qk = &e.m.quant, .pk = &e.m.q4, .qraw = &raw, .bits = bits, .stream = e.stream };
+    var l: Loader = .{ .gpa = gpa, .io = io, .file = file, .ents = &ents, .w = &wbuf, .tmp = &tmp, .mk = &e.m.mm, .qk = &e.m.quant, .pk = &e.m.q4, .qraw = &raw, .bits = bits, .q32 = q32env(), .stream = e.stream };
     defer {
         l.buf.deinit(gpa);
         l.sub.deinit(gpa);
@@ -236,12 +256,13 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
     }
     if (dr.fc == .bf16) part = @max(part, mm.partBytes(64, dr.fc.bf16));
     part = @max(part, mm.partBytes(64, dr.hproj));
+    const gwidth: u64 = if (dr.fc == .q4g32) 32 else 64; // the group sums' width (TF_GLM_DFLASH2_Q32)
     const fields = .{
         .{ "x", M * D * 2 },                                                                     .{ "y", M * D * 2 },                        .{ "y2", M * D * 2 },                .{ "dyn", M * KVW * 2 },
         .{ "qkv", M * df.QKV * 2 },                                                              .{ "q", M * D * 2 },                        .{ "kb", M * KVW * 2 },              .{ "vb", M * KVW * 2 },
         .{ "att", M * D * 2 },                                                                   .{ "a", M * D * 2 },                        .{ "gu", M * 2 * FF * 2 },           .{ "act", M * FF * 2 },
-        .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / 64) * 4 },                .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
-        .{ "part", part },                                                                       .{ "gs", C * 5 * (D / 64) * 4 },            .{ "sums", 2 * M * D * 4 },          .{ "cin", C * df.TAP_ROW },
+        .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / gwidth) * 4 },            .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
+        .{ "part", part },                                                                       .{ "gs", C * 5 * (D / gwidth) * 4 },        .{ "sums", 2 * M * D * 4 },          .{ "cin", C * df.TAP_ROW },
         .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                      .{ "ckv", C * 2 * KVW * 2 },         .{ "taps_step", df.STEP_ROWS * df.TAP_ROW },
         .{ "taps_prefill", C * df.TAP_ROW },                                                     .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
         .{ "starts", df.MAX_S * 8 },                                                             .{ "froms", df.MAX_S * 8 },                 .{ "cpos", C * 8 },                  .{ "crings", C * 8 },

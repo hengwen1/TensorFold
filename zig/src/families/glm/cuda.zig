@@ -21,6 +21,7 @@ pub const mlp = @import("cuda_mlp.zig");
 pub const shard = @import("cuda_shard.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const forward = @import("cuda_forward.zig");
+pub const state = @import("cuda_state.zig");
 pub const relay = @import("cuda_relay.zig");
 pub const config = @import("config.zig");
 pub const quant = @import("cuda_quant.zig");
@@ -30,6 +31,7 @@ pub const sampler = @import("cuda_sampler.zig");
 pub const prompt_sink = @import("cuda_prompt_sink.zig");
 pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
 pub const engine = @import("cuda_engine.zig");
+pub const prompt_pair = @import("cuda_prompt_pair.zig");
 pub const pages = @import("cuda_pages.zig");
 pub const open_owner = @import("cuda_open_owner.zig");
 pub const images = @import("cuda_images.zig");
@@ -47,6 +49,10 @@ test {
     _ = @import("cuda_images_interleave_test.zig");
     _ = @import("cuda_pages_test.zig");
     _ = @import("cuda_ranks_test.zig");
+    _ = @import("cuda_p2p.zig");
+    _ = @import("cuda_ce.zig");
+    _ = @import("cuda_lanes_test.zig");
+    _ = prompt_pair;
     _ = experts;
     _ = exl3;
     _ = vision;
@@ -78,6 +84,7 @@ test {
     _ = native;
     _ = @import("cuda_qpack.zig");
     _ = @import("cuda_mtp_chance.zig");
+    _ = @import("cuda_snapshot_host.zig");
     _ = @import("cuda_tile.zig");
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
 }

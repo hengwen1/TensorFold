@@ -24,6 +24,25 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usi
     }
 }
 
+/// Two bf16-stored projections of a decode window in one glm_mm launch, each with its own shape and K slices
+/// (cuda_mm.matmulTwo): out[z] [m][n[z]] bf16 = x[z] . w[z], `matmul`'s bits. False (nothing launched) unless both are
+/// tiled linears of one width, the window is a decode one, and `part` (`part_bytes`) holds both problems' slices.
+pub fn matmulTwo(set: glue.Set, stream: cuda.Stream, w: [2]Proj, x: [2]u64, x_stride: [2]usize, out: [2]u64, n: [2]usize, k: [2]usize, part: u64, part_bytes: usize, m: usize) !bool {
+    const mk = set.mm orelse return false;
+    if (set.prompt) return false;
+    const mm = @import("cuda_mm.zig");
+    var p: [2]mm.Two = undefined;
+    for (&p, w, x, x_stride, out, n, k) |*q, wz, xz, sz, oz, nz, kz| {
+        const b = switch (wz) {
+            .bf16 => |b| b,
+            .fp8g, .mxfp8 => return false,
+        };
+        if (kz % b16.bk != 0) return false;
+        q.* = .{ .x = xz, .ldx = sz, .w = if (set.packs) |pk| pk.tiled(b, nz, kz) else .{ .w = b, .n = nz, .k = kz }, .out = oz };
+    }
+    return mm.matmulTwo(mk, stream, p, part, part_bytes, m);
+}
+
 /// error.SlicePartialsNotHeld when `matmul` would refuse `w` on `lane` at some row count: the loader's check.
 pub fn fits(lane: *const cuda.qmmf.Lane, w: cuda.qmmf.Weight) error{SlicePartialsNotHeld}!void {
     // one row stands for all: under qmmf.fused_rows the plan is the same for every row count, and over it none reduces

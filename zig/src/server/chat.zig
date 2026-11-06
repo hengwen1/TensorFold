@@ -46,7 +46,11 @@ pub const Sink = struct {
     begin: ?*const fn (ctx: *anyopaque, prompt_len: usize) error{Closed}!void = null,
 };
 
+/// A JSON answer is data; offered tools still belong in its prompt.
+pub const ResponseChannel = enum { automatic, structured_json };
+
 pub const Reply = struct {
+    response_channel: ResponseChannel = .automatic,
     content: []const u8,
     stop_sequence: ?[]const u8,
     reasoning: ?[]const u8,
@@ -107,6 +111,7 @@ fn flag(f: Value, key: []const u8) ?bool {
 
 /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
 pub const Prepared = struct {
+    response_channel: ResponseChannel = .automatic,
     input: Input,
     request: api.Request,
     prompt_len: usize,
@@ -199,7 +204,11 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
+    const response_channel: ResponseChannel = if (request.structure) |st| switch (st.kind) {
+        .json, .json_schema => .structured_json,
+        else => .automatic,
+    } else .automatic;
+    return .{ .response_channel = response_channel, .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -243,12 +252,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     srv.release(preparing, null); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+        if (sink != null and gen.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
@@ -287,7 +296,8 @@ const Generation = struct {
     ignore_eos: bool,
     max_tokens: u32,
     token_ids: bool, // "return_token_ids": the response's tensorfold block carries the reply's token ids
-    tools: []const Value,
+    response_channel: ResponseChannel = .automatic,
+    tools: []const Value, // none on the JSON channel: the answer is data, whatever it looks like
     calls: ?tool_stream.Streamer = null,
     collected: std.ArrayList(u32) = .empty,
     visible: reply_text.Incremental = .{},
@@ -370,7 +380,7 @@ const Generation = struct {
         }
         answer = try tool_lfm2.dsml(g.a, answer, g.tools, false); // the answer only, so a call the reasoning mentions is not made
         const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false, true) else answer;
-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
+        const vis = if (g.response_channel == .structured_json) shown else reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
@@ -488,7 +498,7 @@ const Generation = struct {
             const r = reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
-        } else {
+        } else if (g.response_channel != .structured_json) {
             const h = reply_text.parseHarmony(text);
             content = h.content;
             reasoning = h.reasoning;
@@ -560,6 +570,7 @@ const Generation = struct {
         };
         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
         const reply: Reply = .{
+            .response_channel = g.response_channel,
             .content = content,
             .stop_sequence = g.stops.matched(raw),
             .reasoning = reasoning,

@@ -10,7 +10,7 @@ pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
     if (parts.len == 0 or parts.len > engine.max_together) return false;
     var rows: usize = 0;
     for (parts, 0..) |p, i| {
-        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows >= capacity) return false;
+        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows > capacity) return false;
         for (parts[0..i]) |q| if (q.slot == p.slot) return false;
         rows += p.ids.len;
     }
@@ -38,7 +38,9 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
     }
     try e.gate(null);
     var one: [1]Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
-    var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(true) else null };
+    var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(true) else null };
+    // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)
+    if (comptime @hasField(Forward, "ce") and @hasField(@TypeOf(e.*), "ce")) f.ce = e.ce;
     try f.run(@ptrCast(ids[0..rows]));
     if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
         try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
@@ -53,7 +55,7 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
     for (parts, segs[0..parts.len]) |p, g| {
         one[0] = .{ .w = &e.w, .st = g.st, .b = &e.bp };
         // decode._absorb_rows; the head's pass writes final-norm row 0, which the hold rows above already copied
-        if (e.mtp and g.rows > 1) {
+        if (e.mtp and e.drafter == null and g.rows > 1) { // with a drafter the target MTP caches are never read (cuda_engine)
             try f.mtp(@ptrCast(p.ids[1..]), &.{e.bp.fnormed + g.row0 * D * 2});
             try g.st.setMtpLen(e.stream, g.st.mtp_len + g.rows - 1);
         }

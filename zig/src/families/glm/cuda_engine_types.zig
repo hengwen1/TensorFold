@@ -18,7 +18,15 @@ pub const Seq = struct {
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
-pub const Snap = struct { lease: @import("cuda_snapshot_pages.zig").Lease, len: usize, pos: usize, mtp_len: usize, cur: []u1, bases: [2]usize };
+pub const Snap = struct {
+    lease: @import("cuda_snapshot_pages.zig").Lease,
+    len: usize,
+    pos: usize,
+    mtp_len: usize,
+    cur: []u1,
+    bases: [2]usize,
+    ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
+};
 
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
 pub const Resume = struct { id: u64, at: usize };
@@ -36,7 +44,7 @@ const images_mod = @import("cuda_images.zig");
 
 pub const Options = struct {
     capacity: usize, // tokens a sequence holds
-    mtp: bool, // load the MTP head (drafts)
+    drafts: bool, // speculation on: a draft head (the MTP layer's, or DFlash2's borrowed 4-bit head) and shared windows
     settings: ranks.Settings,
     vision: ?images_mod.Limits = null, // --vision's limits (null: off): every rank must hold the rows rank 0 sends
     drafter: bool = false, // DFlash2 loads after rank agreement

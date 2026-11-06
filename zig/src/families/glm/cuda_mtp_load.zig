@@ -9,8 +9,8 @@ const q4 = @import("cuda_q4.zig");
 
 const prefix = "model.language_model.";
 
-/// weights.load's MTPW: layer `layers` as plain DSA + MoE, norms, eh_proj, draft head from the rank's head rows.
-pub fn load(L: anytype, head_ck: *core.Checkpoint) !weights.Mtp {
+/// weights.load's MTPW: layer `layers` as plain DSA + MoE, norms and eh_proj (the draft head is `draft`'s).
+pub fn load(L: anytype) !weights.Mtp {
     const c = &L.w.config;
     const i = c.layers;
     const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");
@@ -23,7 +23,7 @@ pub fn load(L: anytype, head_ck: *core.Checkpoint) !weights.Mtp {
         try L.whole(try L.get("layers.{d}.{s}", .{ i, name }), .bf16);
         p.* = try L.put("mtp.{s}", .{what});
     }
-    return .{ .enorm = out[0], .hnorm = out[1], .eh = out[2], .norm = out[3], .layer = layer_w, .draft = try draft(L, head_ck) };
+    return .{ .enorm = out[0], .hnorm = out[1], .eh = out[2], .norm = out[3], .layer = layer_w };
 }
 
 /// The draft head's temporary quantizer inputs stay owned until packing completes or its stream drains on error.

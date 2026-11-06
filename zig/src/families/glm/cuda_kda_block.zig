@@ -88,6 +88,12 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
             if (!one) try columns(set, stream, s.tmp, w - fa, s.p + fa * 2, w, rows);
         },
     }
+    if (selected.mm) |mk| if (!selected.prompt) { // a decode window: f_b and g_b (one shape) in one launch, the same sums
+        const mm = @import("cuda_mm.zig");
+        const tb: mm.Tiled = if (selected.packs) |pk| pk.tiled(l.fb, n, kda.dk) else .{ .w = l.fb, .n = n, .k = kda.dk };
+        const tg: mm.Tiled = if (selected.packs) |pk| pk.tiled(l.gb, n, kda.dk) else .{ .w = l.gb, .n = n, .k = kda.dk };
+        if (try mm.matmulPair(mk, stream, s.p + fa * 2, s.p + (fa + kda.dk) * 2, w, tb, tg, s.ka, s.kg, rows)) return;
+    };
     try b16.matmul(selected, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
     try b16.matmul(selected, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
 }
@@ -111,6 +117,14 @@ pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scrat
     const fa = 3 * n;
     const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
     try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+}
+
+/// A shared window's chains (decode, three-kernel): every segment of `t` in one launch each (kda.chainSegs), the
+/// layer's own fields as chainRows passes them; each segment's rows, states and saves come with it.
+pub fn chainSegs(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, t: *const kda.Segs, n: usize) !void {
+    const fa = 3 * l.heads * kda.dk;
+    const c: kda.Chain = .{ .p = 0, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = 0, .a_stride = l.heads * kda.dk, .g = 0, .g_stride = l.heads * kda.dk, .conv_state = 0, .conv_w = l.conv_w, .state_in = 0, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+    try kda.chainSegs(ks, stream, c, t, n);
 }
 
 test {

@@ -213,7 +213,16 @@ pub const LaneHost = struct {
         const job: *Job = @ptrCast(@alignCast(ctx));
         job.host.lock();
         defer job.host.unlock();
-        return job.host.foregroundWaiting() or job.host.core.activeCount() > 0;
+        return job.host.warmBlocked(job);
+    }
+
+    /// Work a warm pass steps aside for, the caller holding the lock: a foreground request queued, or admitted and
+    /// not yet decoding (its prompt in the fill queue, a chunk a round, which a whole pass would hold up), or any
+    /// stream decoding.
+    fn warmBlocked(h: *const LaneHost, warm: *const Job) bool {
+        if (h.foregroundWaiting() or h.core.activeCount() > 0) return true;
+        for (h.admitted.items) |other| if (other != warm and !other.request.background) return true;
+        return false;
     }
 
     /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
@@ -226,7 +235,7 @@ pub const LaneHost = struct {
         const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
         h.lock();
         defer h.unlock();
-        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
+        while (!h.closing and !h.warmBlocked(job) and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
             h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
         }
         return false;
@@ -323,13 +332,13 @@ pub const LaneHost = struct {
     /// A taken job's stream, set up to start; null when the job ended instead (dropped or cancelled).
     pub fn setup(h: *LaneHost, job: *Job) ?i96 {
         const r = job.request;
-        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
+        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) { // other work came first: it ends before its stream opens
+            h.remove(job);
+            h.finish(job, .cancelled, "other work came first");
+            return null;
+        }
         if (!lane_stream.open(h, job)) return null; // the job was finished instead
         return job.began;
-    }
-
-    fn ended(_: *LaneHost, _: bool) ?i96 {
-        return null;
     }
 
     /// Whether a set-up job starts outside a shared prompt pass: a warm pass, or the lone driver's.

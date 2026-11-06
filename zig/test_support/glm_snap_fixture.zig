@@ -20,7 +20,7 @@ pub const Fixture = struct {
         layers[0].mixer = .{ .mla = undefined };
         layers[1].mixer = .{ .kda = undefined };
         w.layers = &layers;
-        f.seq = .{ .st = try glm.forward.State.initFormat(t.allocator, d, &w, 16448, kv8) };
+        f.seq = .{ .st = try glm.forward.State.initHead(t.allocator, d, &w, 16448, kv8, mtp) }; // as Engine.bind makes one
         f.e = undefined;
         f.e.cur = &f.seq;
         f.e.gpa = t.allocator;
@@ -30,6 +30,7 @@ pub const Fixture = struct {
         f.e.share = w.share;
         f.e.capacity = f.seq.st.capacity;
         f.e.mtp = mtp;
+        f.e.drafter = null; // snapshots.bytes budgets the head's rows unless a drafter is loaded
         f.e.snaps = .empty;
         f.e.snap_pages = null;
         f.e.snap_setup = null;

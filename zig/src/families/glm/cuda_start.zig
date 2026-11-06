@@ -16,11 +16,12 @@ fn resolved(p: anytype, text: ?[]const u8, initial: anytype, args: anytype, comp
     return after(args, settings);
 }
 
-/// TF_KV_PAGES keeps FP8 on whole windows; explicit pages with FP8 are refused on every rank.
+/// TF_KV_PAGES: auto pages bf16 from two ranks and keeps FP8 on whole windows; on (1, all) pages either format, its
+/// E4M3 codes and scales in each page (one shared pool: a stream takes the pages its request needs).
 pub fn paging(text: ?[]const u8, world: usize, kv8: bool) !bool {
     const v = text orelse "auto";
     if (std.mem.eql(u8, v, "auto")) return world >= 2 and !kv8;
     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return false;
-    if (kv8) return error.Fp8OnPages;
-    return true;
+    for ([_][]const u8{ "on", "1", "all" }) |on| if (std.mem.eql(u8, v, on)) return true;
+    return error.BadKvPages; // refused on every rank by name, not read as on
 }

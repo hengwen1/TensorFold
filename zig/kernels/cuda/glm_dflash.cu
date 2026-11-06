@@ -350,3 +350,14 @@ extern "C" __global__ void df_gsum(const __nv_bfloat16* __restrict__ x, int ldx,
         xs[(long long)r * groups + g] = s;
     }
 }
+
+// The 32-group sums (TF_GLM_DFLASH2_Q32's linears): groups of 32, xs [rows][k / 32].
+extern "C" __global__ void df_gsum32(const __nv_bfloat16* __restrict__ x, int ldx, int k, float* __restrict__ xs) {
+    const int r = blockIdx.x, groups = k / 32;
+    const __nv_bfloat16* xr = x + (long long)r * ldx;
+    for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+        float s = 0.f;
+        for (int i = 0; i < 32; ++i) s += bf(xr[g * 32 + i]);
+        xs[(long long)r * groups + g] = s;
+    }
+}

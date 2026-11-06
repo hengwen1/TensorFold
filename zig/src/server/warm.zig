@@ -19,6 +19,13 @@ const Pass = struct {
     fn event(ptr: *anyopaque, _: api.Id, e: *const api.Event) void {
         if (e.* != .finished) return;
         const p: *Pass = @ptrCast(@alignCast(ptr));
+        const f = e.finished;
+        log.line("next turn: background prefill of {d} tokens {s}{s}{s} (queued {d:.2}s)", .{ p.request.prompt.len, switch (f.reason) {
+            .length => "done",
+            .cancelled => "stepped aside",
+            .failed => "failed",
+            else => "ended",
+        }, if (f.message.len > 0) ": " else "", f.message, f.stats.queued_seconds });
         var arena = p.arena;
         p.gpa.destroy(p);
         arena.deinit();
@@ -59,19 +66,24 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
     handed = true;
 }
 
-/// The tokens every next user or tool turn shares: two renderings agree up to that turn's text.
+/// The tokens every next turn shares: two renderings agree up to that turn's text. After a call the next turn is a
+/// tool result, after an answer a user message: a template that clears earlier turns' reasoning (GLM's) renders the
+/// loop's turns differently before each, and only the turn that comes next is worth prefilling.
 fn shared(srv: *Server, cx: *errors.Cx, input: chat.Input, message: Value, thinking: bool, effort: ?[]const u8) !struct { ids: []const u32, messages: []Value } {
     const before = input.messages.array;
+    const calls = message.get("tool_calls");
+    const called = calls != null and calls.? == .array and calls.?.array.len > 0;
     var ids: [2][]const u32 = undefined;
     var first: []Value = undefined;
     for ([_][]const u8{ "A", "B" }, &ids, 0..) |text, *out, i| {
         const list = try cx.a.alloc(Value, before.len + 2);
         @memcpy(list[0..before.len], before);
         list[before.len] = message;
-        const user = try json.newObject(cx.a);
-        try user.put(cx.a, "role", .{ .string = "user" });
-        try user.put(cx.a, "content", .{ .string = text });
-        list[before.len + 1] = .{ .object = user };
+        const next = try json.newObject(cx.a);
+        try next.put(cx.a, "role", .{ .string = if (called) "tool" else "user" });
+        if (called) if (calls.?.array[0].get("id")) |id| if (id == .string) try next.put(cx.a, "tool_call_id", id);
+        try next.put(cx.a, "content", .{ .string = text });
+        list[before.len + 1] = .{ .object = next };
         if (i == 0) first = list;
         out.* = try prompt_mod.renderIds(srv, cx, .{ .array = list }, input.tools, thinking, effort, true);
     }

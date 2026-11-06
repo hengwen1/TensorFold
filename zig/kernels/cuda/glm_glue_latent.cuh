@@ -93,3 +93,23 @@ extern "C" __global__ void __launch_bounds__(512)
   __shared__ float red[16];
   tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + at * 512, scales + at, red);
 }
+
+// The same row on KV pages: page pt[at / 512] holds its codes at row at % 512 of this cache's part (from `cache`) and its
+// scale at that row of the part's scales (from `scales`), the pages `ps` bytes apart; the rounding is the window's.
+namespace glm_latw {
+// tf_glm_lat_write_fp8_paged's row r (a segment-batched launch passes r; the kernel passes blockIdx.x)
+__device__ __forceinline__ void write_fp8_paged(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache,
+                                                float* scales, const int* pos, const int* pt, int64_t ps, int64_t r) {
+  const int64_t at = (int64_t)pos[0] + r;
+  const int64_t page = (int64_t)pt[at / 512] * ps, row = at % 512;
+  const int d = threadIdx.x;
+  __shared__ float red[16];
+  float* s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(scales) + page) + row;
+  tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + page + row * 512, s, red);
+}
+}  // namespace glm_latw
+extern "C" __global__ void __launch_bounds__(512)
+    tf_glm_lat_write_fp8_paged(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales,
+                               const int* pos, const int* pt, int64_t ps) {
+  glm_latw::write_fp8_paged(lat, stride, cache, scales, pos, pt, ps, blockIdx.x);
+}

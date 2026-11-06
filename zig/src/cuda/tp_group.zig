@@ -6,6 +6,8 @@ const stream_ = @import("stream.zig");
 const memory = @import("memory.zig");
 const roce = @import("roce.zig");
 const p2p_report = @import("p2p_report.zig");
+const p2p_gather = @import("p2p_gather.zig");
+const Function = @import("module.zig").Function;
 
 const Stream = stream_.Stream;
 
@@ -16,6 +18,7 @@ pub const Group = struct {
     world: usize,
     aborted: std.atomic.Value(bool) = .init(false),
     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
+    p2p: ?*p2p_gather.Gather = null, // two ranks on one host: one stream's small all-gathers by peer stores (openP2p)
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
     pub fn open(d: *const driver.Driver, rank: usize, world: usize) !Group {
@@ -35,6 +38,7 @@ pub const Group = struct {
 
     pub fn close(g: *Group) void {
         p2p_report.ready(); // a transport line still owed is reported before the communicator goes
+        if (g.p2p) |p| p.deinit();
         if (g.fast) |f| f.deinit();
         g.destroyComm();
         g.lib.close();
@@ -46,7 +50,14 @@ pub const Group = struct {
     }
 
     pub fn abort(g: *Group) void {
+        if (g.p2p) |p| p.abort(); // a peer-store gather still waiting gives up too
         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
+    }
+
+    /// Two ranks on one host: gathers on `s` up to `cap` bytes a rank go by peer stores if both ranks want and map it.
+    pub fn openP2p(g: *Group, gpa: std.mem.Allocator, d: *const driver.Driver, s: Stream, f: Function, wanted: bool, cap: usize, timeout_ns: u64) !void {
+        if (g.world != 2 or g.p2p != null) return;
+        g.p2p = try p2p_gather.Gather.open(gpa, d, g, s, f, wanted, cap, timeout_ns);
     }
 
     /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
@@ -57,11 +68,13 @@ pub const Group = struct {
 
     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
     pub fn check(g: *const Group) !void {
+        if (g.p2p) |p| try p.check();
         if (g.fast) |f| try f.check();
     }
 
     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.
     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
+        if (g.p2p) |p| if (p.fits(s.handle, bytes)) return p.gather(s, mine, all, bytes);
         if (g.fast) |f| if (f.fits(bytes)) return f.gather(s.handle, mine, all, bytes);
         try g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
     }

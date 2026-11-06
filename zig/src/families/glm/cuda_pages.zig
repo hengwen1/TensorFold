@@ -12,11 +12,30 @@ pub fn tableLen(capacity: usize) usize {
     return (capacity + state.page_rows - 1) / state.page_rows;
 }
 
-/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
+/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
+/// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
+/// A layout of no token bytes (no DSA layer, no target MTP head) is error.NoPagedCaches: the pool divides by its page.
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
-    const fixed = try state.State.pagedBytes(gpa, &e.w, e.capacity, tableLen(e.capacity));
-    const page = state.pageBytes(&e.w);
+    if (!pageable(e)) return error.NoPagedCaches;
+    const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
+    const page = pageBytes(e);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
+}
+
+/// A page's bytes for engine `e`: its cache format's parts, the target MTP head's only when it is loaded.
+pub fn pageBytes(e: *const Engine) u64 {
+    return state.pageBytesOf(&e.w, e.settings.kv8, e.mtp);
+}
+
+/// Whether engine `e` has caches to page: a thin model of KDA layers alone (TF_GLM_LAYERS) without the target MTP head
+/// has none, so its sequences keep their windows (of no KV rows) whatever TF_KV_PAGES says.
+pub fn pageable(e: *const Engine) bool {
+    return pageBytes(e) > 0;
+}
+
+/// A paged sequence of engine `e`'s format on the pages at `at`.
+fn pagedState(e: *const Engine, at: state.Paged) !fw.State {
+    return fw.State.initPagedFormat(e.gpa, e.d, &e.w, e.capacity, at, e.settings.kv8, e.mtp);
 }
 
 /// A request's need: its prompt, its reply and one last verify window.
@@ -30,7 +49,7 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
+    q.* = .{ .st = try pagedState(e, on(e, 0, pageBytes(e))) };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
@@ -51,6 +70,7 @@ pub const Pages = struct {
     used: []bool,
     leader: bool,
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
+    waiting: ?usize = null, // rank 0: the pages the request admission last held back needs (one log line a wait)
 
     /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
@@ -83,7 +103,7 @@ pub const Pages = struct {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream
             const s = try e.gpa.create(types.Seq);
             errdefer e.gpa.destroy(s);
-            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at) };
+            s.* = .{ .st = try pagedState(e, at) };
             q.* = s;
             made += 1;
         }
@@ -125,10 +145,32 @@ pub const Pages = struct {
         return slot < p.used.len;
     }
 
-    /// Whether a request's pages fit now and a paged sequence is free for it.
-    pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
-        for (p.used) |u| if (!u) return p.pool.fits(need(p.layout, prompt, max_tokens));
-        return false;
+    /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
+    /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
+    pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
+        const n = need(p.layout, prompt, max_tokens);
+        const free_seq = for (p.used) |u| {
+            if (!u) break true;
+        } else false;
+        const ok = free_seq and (n > p.pool.total() or p.pool.fits(n));
+        p.noteWait(n, prompt, max_tokens, ok, free_seq);
+        return ok;
+    }
+
+    /// One line when admission starts holding a request back, saying for what, and one when it fits again.
+    fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
+        if (@import("builtin").is_test) return;
+        if (ok) { // the held-back request's own admission ends its wait (another request fitting beside it does not)
+            if (p.waiting == n) {
+                std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ n, p.pool.available(), p.pool.total() });
+                p.waiting = null;
+            }
+            return;
+        }
+        if (p.waiting == n) return;
+        p.waiting = n;
+        if (!free_seq) return std.log.info("kv pool: a request ({d} prompt + {d} reply tokens, {d} pages) waits for a stream: all {d} paged sequences are busy", .{ prompt, max_tokens, n, p.used.len });
+        std.log.info("kv pool: a request ({d} prompt + {d} reply tokens) waits for {d} pages: {d} free and {d} reclaimable of {d}, while the running streams hold the rest", .{ prompt, max_tokens, n, p.pool.available(), p.pool.reclaimable(), p.pool.total() });
     }
 
     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.
@@ -136,6 +178,7 @@ pub const Pages = struct {
         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
         const n = need(p.layout, prompt, max_tokens);
         if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
+        if (n > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
         const l = &p.leases[slot];
         try p.pool.promise(l, n);
         errdefer p.pool.finish(l);
@@ -161,6 +204,9 @@ pub const Pages = struct {
 
     /// The slot's sequence reaches its pages' rows (NaN first under TF_KV_POISON).
     fn mapped(p: *Pages, slot: u32, ids: []const u32) !void {
+        // every id names a page of this pool, on every rank (the kernels read pt[pos / 512] for pos under the capacity
+        // set below, and State.ready refuses a pass past it), so no table can send a kernel past the pages' arena
+        for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
         const st = &p.e.seqs.items[slot].?.st;
         const page = p.layout.pageBytes();
         if (p.poison) for (ids) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");

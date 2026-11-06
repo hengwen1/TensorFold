@@ -50,13 +50,13 @@ fn run(w: *World, rank: usize, world: usize, text: ?[]const u8, kv8: bool) !void
 }
 
 fn refusal(rank: usize) !void {
-    for ([_][]const u8{ "on", "all", "1" }) |mode| {
+    for ([_][]const u8{ "yes", "pages", "2" }) |mode| {
         var w: World = .{};
         const peer = 1 - rank;
         try run(&w, peer, 2, "auto", true);
         try std.testing.expect(w.waiting[peer]);
-        try std.testing.expectError(error.Fp8OnPages, run(&w, rank, 2, mode, true));
-        try std.testing.expectEqualStrings("Fp8OnPages", w.refused[peer] orelse "waiting for missing rank");
+        try std.testing.expectError(error.BadKvPages, run(&w, rank, 2, mode, true));
+        try std.testing.expectEqualStrings("BadKvPages", w.refused[peer] orelse "waiting for missing rank");
         try std.testing.expect(!w.waiting[peer]);
         try std.testing.expect(w.connected[rank] and w.connected[peer]);
         try std.testing.expect(!w.constructed[rank]);
@@ -65,18 +65,17 @@ fn refusal(rank: usize) !void {
     }
 }
 
-test "GLM startup: refusing rank zero promptly tells the waiting follower Fp8OnPages" {
+test "GLM startup: refusing rank zero promptly tells the waiting follower BadKvPages" {
     try refusal(0);
 }
 
-test "GLM startup: refusing follower promptly tells waiting rank zero Fp8OnPages" {
+test "GLM startup: refusing follower promptly tells waiting rank zero BadKvPages" {
     try refusal(1);
 }
 
 test "GLM startup: valid modes reach construction with every other setting intact" {
     for ([_]bool{ false, true }) |kv8| for ([_][]const u8{ "auto", "off", "0", "on", "all" }) |mode| {
-        if (kv8 and (std.mem.eql(u8, mode, "on") or std.mem.eql(u8, mode, "all"))) continue;
-        var w: World = .{};
+        var w: World = .{}; // E4M3 pages too: on and all reach construction with pages
         try run(&w, 0, 2, mode, kv8);
         try std.testing.expect(w.connected[0]);
         try std.testing.expect(w.constructed[0]);

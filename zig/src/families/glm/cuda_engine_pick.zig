@@ -13,6 +13,41 @@ pub fn greedyChance(e: *Engine, logits: u64) !chance.Pick {
     return pick(e, logits, true);
 }
 
+/// Greedy picks of a window's `rows` rows (logits rows V apart): one top-1 launch of a block a row (tf_glm_top1_rows,
+/// tf_glm_top1's words for each), then one gather of every rank's words, one sync and one read (rank order
+/// [world][rows]), each row picked as `greedy` picks it. A follower's verify rows (Engine.discard_draws) join the
+/// gather and stop there: rank 0 alone reads the tokens.
+pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+    if (rows == 0) return;
+    if (rows > @import("cuda_engine.zig").pick_rows) return error.WindowTooWide;
+    const world = e.share.world;
+    const V = e.share.vocab.len();
+    const mine = e.pairs.ptr + e.share.rank * rows * pair_bytes;
+    var a: cuda.Args = .{};
+    a.add(logits);
+    a.add(@as(i64, @intCast(V)));
+    a.add(@as(i64, @intCast(V))); // the rows' stride
+    a.add(@as(u32, @intCast(e.share.vocab.lo)));
+    a.add(mine);
+    try cuda.launch.launch(e.m.glue.top1_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+    const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
+    if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+    stamp.end();
+    if (e.discard_draws) {
+        @memset(out[0..rows], 0);
+        return;
+    }
+    try e.stream.synchronize();
+    try e.checkGathers();
+    var all: [ranks.max_world * 32][4]u32 = undefined;
+    try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * rows * pair_bytes), "cuMemcpyDtoH");
+    for (0..rows) |r| {
+        var words: [ranks.max_world][4]u32 = undefined;
+        for (0..world) |q| words[q] = all[q * rows + r];
+        out[r] = chance.pick(words[0..world], false).token;
+    }
+}
+
 fn pick(e: *Engine, logits: u64, sums: bool) !chance.Pick {
     const world = e.share.world;
     var a: cuda.Args = .{};

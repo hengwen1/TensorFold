@@ -308,6 +308,8 @@ extern "C" __global__ void __launch_bounds__(256, 2)
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_router_tile(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
                        int64_t d, int64_t ne, int ks) {
+  // an ordinary launch that lets the select after it (a dependent launch on decode windows, waiting first) launch now
+  glm_triton::pdl_trigger();
   constexpr int BM = 64, BE = 32, KS = 64, LD = KS + 8, A = BM * LD, B = BE * LD, STAGE = (A + B) * 2, RPI = 16;
   __shared__ __align__(16) __nv_bfloat16 sm[2][A + B];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;

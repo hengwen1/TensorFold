@@ -81,6 +81,7 @@ const Fake = struct {
         f.e.pages = null;
         f.e.images = null;
         f.e.settings = .{};
+        f.e.mtp = true; // the target MTP head's part on every page (DFlash2 tests turn it off)
         f.e.w = undefined;
         f.e.w.config = .{};
         f.e.w.share = try shard.Share.of(&f.e.w.config, 0, 2);
@@ -276,4 +277,80 @@ test "every host allocation failure while making the pages leaves no device buff
             try expectEqual(@as(usize, 0), F.live);
         }
     }.run, .{});
+}
+
+test "E4M3 pages beside DFlash2: a page holds each DSA layer's codes, scales and pooled keys, no MTP part" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    f.e.settings.kv8 = true;
+    f.e.mtp = false;
+    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
+    try expectEqual(@as(u64, 512 + 4 + 64), l.token_bytes); // one DSA layer: codes, its scale, pooled keys
+    const p = try f.pool(l, 3, 8, true);
+    defer f.deinit(p);
+    _ = try p.open(1, 600, 100);
+    const st = &f.e.seqs.items[1].?.st;
+    const x = st.caches[0];
+    try expect(st.kv8 and !st.head);
+    try expectEqual(x.lc + 512 * 512, x.ls); // the part's scales after its codes
+    try expectEqual(x.ls + 512 * 4, x.pk); // its pooled keys last
+    try expectEqual(l.pageBytes(), x.ps);
+    try expectEqual(@as(u64, 296_960), l.pageBytes());
+    p.close(1);
+}
+
+test "a request needing more pages than the whole pool is admitted at once and refused, never left waiting" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
+    const p = try f.pool(l, 3, 4, true); // 4 pages: 2,048 rows in all
+    defer f.deinit(p);
+    try expect(p.fits(3000, 100)); // 7 pages: past the pool, inside the window's table of 8
+    try std.testing.expectError(error.PoolTooSmall, p.open(1, 3000, 100));
+    try expectEqual(@as(usize, 0), f.e.seqs.items[1].?.st.capacity);
+    try expect(p.pool.idle() and p.pool.census().free == 4); // nothing promised or taken
+    _ = try p.open(1, 1500, 100); // 4 pages: the whole pool
+    try expect(!p.fits(600, 100)); // waits: the running stream holds every page
+    try expect(p.fits(3000, 100)); // still refused at once, not left waiting
+    p.close(1);
+    try expect(p.fits(600, 100));
+}
+
+test "TF_KV_PAGES on a model of KDA layers alone without the MTP head: nothing to page, so its layout is refused by name" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    for (&f.layers) |*l| l.mixer = .{ .kda = undefined }; // TF_GLM_LAYERS=1: no DSA layer is loaded
+    for ([_]bool{ false, true }) |kv8| {
+        f.e.settings.kv8 = kv8;
+        f.e.mtp = false; // --no-drafts or DFlash2
+        try expectEqual(@as(u64, 0), pages_mod.pageBytes(&f.e)); // a zero-byte page: the pool's plan would divide by it
+        try expect(!pages_mod.pageable(&f.e)); // Engine.init keeps every stream's window instead
+        try std.testing.expectError(error.NoPagedCaches, pages_mod.layout(std.testing.allocator, &f.e, 0));
+        f.e.mtp = true; // the target MTP head's cache alone still pages
+        try expect(pages_mod.pageable(&f.e));
+        try expect((try pages_mod.layout(std.testing.allocator, &f.e, 0)).token_bytes > 0);
+    }
+    f.e.mtp = false;
+    f.layers[1].mixer = .{ .mla = undefined }; // one DSA layer pages without the head
+    try expect(pages_mod.pageable(&f.e));
+    try expect(@import("cuda_native.zig").explain(null, error.NoPagedCaches) != null);
+    try expectEqual(@as(usize, 0), f.e.seqs.items.len); // nothing was made for it
+}
+
+test "capacity keeps a request exactly at --context: prompt + max_tokens == context passes the opening and prompt checks" {
+    const native = @import("cuda_native.zig");
+    const window: usize = @import("cuda_state.zig").window_rows; // a verify window's rows past the reply (8, or 16 with W16)
+    for ([_]usize{ 8192 - window, 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
+        const cap = native.capacity(context);
+        for ([_]usize{ 1, 184, context / 2 }) |max_new| {
+            const prompt = context - max_new;
+            try expect(Lanes.fitsContext(prompt, max_new, cap));
+            const rows = pages_mod.tableLen(prompt + max_new + window) * @import("cuda_state.zig").page_rows; // its pages' rows
+            try expect(Engine.promptFits(prompt, @min(rows, cap))); // a paged stream's capacity (Pages.mapped)
+            try expect(Engine.promptFits(prompt + max_new, cap)); // a prompt-only turn at the context too
+        }
+        try expect(!Lanes.fitsContext(cap - window, 1, cap)); // a window past the capacity
+        try expect(!Engine.promptFits(cap - window + 1, cap));
+        try expect(!Engine.promptFits(0, cap));
+    }
 }

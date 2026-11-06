@@ -29,6 +29,7 @@ const fw = struct {
         split: bool,
         kda_wide: bool,
         ring: bool = false,
+        absorb_mma: bool = false, // TF_GLM_ABSORB_MMA (num3): the engine's opt-in prompt numerics, off here
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
             observed_ring = f.ring;
@@ -69,7 +70,7 @@ const engine = struct {
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
         share: struct { vocab: Vocab = .{} } = .{},
-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true } = .{},
+        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, numerics: struct { absorb_mma: bool = false } = .{} } = .{},
         d: u8 = 0,
         m: u8 = 0,
         stream: u8 = 0,
@@ -102,7 +103,7 @@ const engine = struct {
     pub const Drafter = struct {
         taps_prefill: u64 = 0,
         states: [32]Slot = @splat(.{}),
-        const Slot = struct { ring: ?struct { ptr: u64 } = null };
+        const Slot = struct { ring: ?struct { ptr: u64 } = null, first: i64 = glm.dflash.no_rows, end: i64 = 0 }; // mem2's prompt run
         pub fn taps(dr: *Drafter, _: bool) fw.Taps {
             return .{ .out = dr.taps_prefill };
         }

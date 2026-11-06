@@ -440,7 +440,7 @@ const Tamper = struct { name: ?[]const u8, done: usize = 0, caught: usize = 0 };
 /// Rank `rank` of `world` loaded, each upload compared: how many differ or are not known, one more if none was.
 fn rankGate(gpu: check.Gpu, a: std.mem.Allocator, ck: *core.Checkpoint, c: *const Config, m: *const glm.forward.Modules, stream: cuda.Stream, dir: []const u8, layers: []const u32, rank: usize, world: usize, tamper: *Tamper) !usize {
     const s = try glm.shard.Share.of(c, rank, world);
-    var w = try glm.weights.load(gpu.gpa, gpu.io, gpu.d, stream, m.tools(), dir, c.*, s, layers, true);
+    var w = try glm.weights.load(gpu.gpa, gpu.io, gpu.d, stream, m.tools(), dir, c.*, s, layers, .mtp);
     defer w.deinit();
     var bad: usize = 0;
     var cut: usize = 0;

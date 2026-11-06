@@ -128,3 +128,44 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
     scales[i] = sb;
     biases[i] = bb;
 }
+
+// The 32-group variant (the reference engine's qwen4_exp quantize4): a thread per 32-group, same stores.
+extern "C" __global__ void tf_glm_quantize4_32(const __nv_bfloat16* __restrict__ w, long long groups,
+                                               int32_t* __restrict__ words, __nv_bfloat16* __restrict__ scales,
+                                               __nv_bfloat16* __restrict__ biases) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= groups) return;
+    const uint4* src = reinterpret_cast<const uint4*>(w) + 4 * i;
+    float x[32];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) widen8(src[t], x + 8 * t);
+    float lo = x[0], hi = x[0];
+#pragma unroll
+    for (int j = 1; j < 32; ++j) lo = fminf(lo, x[j]), hi = fmaxf(hi, x[j]);
+    if (lo == 0.0f) {
+        int best = -1;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int r = static_cast<int>(__brev(static_cast<unsigned>(j)) >> 27);
+            if (x[j] == 0.0f && r > best) best = r, lo = x[j];
+        }
+    }
+    const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf((hi - lo) * (1.0f / 15.0f), (float)1e-8));
+    const __nv_bfloat16 bb = __float2bfloat16_rn(lo);
+    const float scale = __bfloat162float(sb), bias = __bfloat162float(bb);
+    uint32_t out[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        uint32_t word = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float q = fminf(fmaxf(rintf(__fdiv_rn(x[8 * t + j] - bias, scale)), 0.0f), 15.0f);
+            word |= static_cast<uint32_t>(q) << (4 * j);
+        }
+        out[t] = word;
+    }
+    uint4* dst = reinterpret_cast<uint4*>(words) + i;
+    dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
+    scales[i] = sb;
+    biases[i] = bb;
+}

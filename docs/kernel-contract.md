@@ -203,6 +203,11 @@ CUDA also checks the affine-3 experts' split decode pair, bit-equal to the pair 
 one dropping a last round of K groups short of the warps, one chaining the groups in reverse).
 CUDA also checks Flash Next's NVFP4 experts on prompt tiles with the decode form's sums (SwiGLU gate-up and fp32
 down, each bit-equal to the decode instance it replaces; the scaled-code prompt tile is the planted control).
+CUDA also checks the grouped EXL3 experts (`tf_exl3_grouped_0`, `_1` and `_2`, one a codebook), which on sm_120 and
+sm_121 load a warp's next k tile while the current one decodes: each bit-equal to main's loop (kept in
+`contract_controls.cu`) at one, two and three k tiles a warp and at GLM-5.3-Flash's, MiMo-V2.6-Flash's and the Qwen3.5
+EXL3 pack's widths (two controls: the next load reading tile i + 2, the last tile decoding the words before it).
+Older SMs build main's loop, and their records are main's.
 
 ## CUDA records per nvcc release
 

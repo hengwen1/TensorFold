@@ -186,7 +186,7 @@ test "every media limit is part of the ranks' agreement" {
 test "every scheduling and identity field that differs stops the ranks" {
     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "capacity", "heat_high", "heat_low" }) |name| {
+    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
         var all = [_]Fingerprint{ zero, one };
         @field(all[1], name) += 1;
         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);
@@ -270,6 +270,28 @@ test "prompt K experiment is explicit and all ranks must agree" {
     try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
 }
 
+test "TF_GLM_PROMPT_PAIR: on by default, 0 or 1, and every rank must agree (the others take rank 0's paired steps)" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn off(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) "0" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) "2" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect((try Settings.read(Reader.absent, &problem)).pair);
+    const off = try Settings.read(Reader.off, &problem);
+    try std.testing.expect(!off.pair);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR: 0 or 1", problem);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, off, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(Mismatch{ .field = .pair, .rank = 1 }, mismatch(&all).?);
+}
+
 test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusal naming a value that is not one" {
     const Reader = struct {
         fn absent(_: [:0]const u8) ?[]const u8 {
@@ -291,4 +313,39 @@ test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusa
     try std.testing.expectEqual(@as(u32, 65536), (try Settings.read(Reader.from, &problem)).index_split);
     try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
     try std.testing.expectEqualStrings("TF_GLM_INDEX_SPLIT: the position a prompt chunk's indexer rows split from, or 0 for never", problem);
+}
+
+fn numeric(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "1";
+    if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "0";
+    return null;
+}
+
+fn numeric32(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "32";
+    if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "1";
+    return null;
+}
+
+fn numericTypo(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "on";
+    return null;
+}
+
+test "the opt-in prompt numerics: off by default, read by name, in the fingerprint, a bad value refused" {
+    var problem: []const u8 = "";
+    const none = try Settings.read(&typo_free, &problem);
+    try std.testing.expectEqual(@as(u32, 0), none.numerics.bits());
+    const s = try Settings.read(&numeric, &problem);
+    try std.testing.expect(s.numerics.w8a8 and !s.numerics.absorb_mma);
+    const f = Fingerprint.of(2, 0, s, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+    try std.testing.expectEqual(s.numerics.bits(), f.numerics);
+    const g = try Settings.read(&numeric32, &problem);
+    try std.testing.expect(g.numerics.w8a8 and g.numerics.w8a8_g32 and g.numerics.absorb_mma);
+    try std.testing.expectError(error.BadSetting, Settings.read(&numericTypo, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_ABSORB_MMA: 0 or 1", problem);
+}
+
+fn typo_free(_: [:0]const u8) ?[]const u8 {
+    return null;
 }

@@ -77,6 +77,12 @@ pub fn schemaTakesJson(a: Allocator, schema: Schema) Allocator.Error!bool {
     return tool_kinds.takesJson(kinds);
 }
 
+/// The schema names no kinds at all (``{}``, a description alone, a reference that resolves nowhere): ``decode`` then
+/// takes a JSON object or array the model wrote and keeps anything else as text.
+pub fn schemaUntyped(a: Allocator, schema: Schema) Allocator.Error!bool {
+    return (try tool_kinds.schemaKinds(a, schema.value, schema.root)) == null;
+}
+
 /// ``json.dumps(v, allow_nan=False)`` succeeds: no NaN or infinity anywhere.
 pub fn finite(v: Value) bool {
     return switch (v) {
@@ -118,8 +124,12 @@ pub fn closedJson(a: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
 }
 
 /// ``decode_parameter``: the schema's type when the text spells one, else the text; ``python`` also reads Python's spelling.
+/// A parameter whose schema names no type (``{}``, or a description alone) takes the text as a JSON object or array when
+/// it parses as one, else as text: scalars, plain words and JSON-quoted strings stay the text the model wrote. Upstream
+/// keeps an untyped value as text; this follows MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#180 (agents' untyped
+/// object arguments came back as JSON strings).
 pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) Allocator.Error!Value {
-    const kinds = (try tool_kinds.schemaKinds(a, schema.value, schema.root)) orelse return .{ .string = value };
+    const kinds = (try tool_kinds.schemaKinds(a, schema.value, schema.root)) orelse return untyped(a, value);
     if (!tool_kinds.takesJson(kinds)) return .{ .string = value };
     const closed: ?[]const u8 = if (kinds.contains(.array) or kinds.contains(.object)) try closedJson(a, value) else null;
     for ([_]?[]const u8{ value, closed }) |candidate| {
@@ -135,6 +145,19 @@ pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) All
     const parsed = (try pythonLiteral(a, value)) orelse return .{ .string = value };
     if (!finite(parsed)) return .{ .string = value };
     return if (tool_kinds.accepts(kinds, parsed)) parsed else .{ .string = value };
+}
+
+/// An untyped parameter's value: a JSON object or array when the text is one (whole, or left open and closed), else the text.
+fn untyped(a: Allocator, value: []const u8) Allocator.Error!Value {
+    for ([_]?[]const u8{ value, try closedJson(a, value) }) |candidate| {
+        const text = candidate orelse continue;
+        const parsed = switch (try json.parseText(a, text)) {
+            .ok => |v| v,
+            .err => continue,
+        };
+        if ((parsed == .object or parsed == .array) and finite(parsed)) return parsed;
+    }
+    return .{ .string = value };
 }
 
 /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
@@ -400,4 +423,27 @@ test "decode parameters" {
     const py = try decode(a, "['a', None, True]", arr, true);
     try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
     try std.testing.expectEqual(Value.null, (try decode(a, " None ", try parseSchema(a, "{\"type\": \"null\"}"), true)));
+}
+
+test "an untyped parameter takes a JSON object or array, and keeps everything else as text (#180)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"description\": \"the record\"}" }) |text| {
+        const untyped_schema = try parseSchema(a, text);
+        const obj = try decode(a, "{\"id\": 7, \"tags\": [\"alpha\", \"beta\"]}", untyped_schema, false);
+        try std.testing.expectEqualStrings("7", obj.object.get("id").?.int);
+        try std.testing.expectEqual(@as(usize, 2), obj.object.get("tags").?.array.len);
+        const arr = try decode(a, "[1, 2]", untyped_schema, false);
+        try std.testing.expectEqual(@as(usize, 2), arr.array.len);
+        const open = try decode(a, "{\"id\": 7", untyped_schema, false); // left open by the end token: closed, as a typed object is
+        try std.testing.expectEqualStrings("7", open.object.get("id").?.int);
+        for ([_][]const u8{ "hello world", "42", "true", "null", "\"quoted\"", "{not json}", "" }) |plain| {
+            try std.testing.expectEqualStrings(plain, (try decode(a, plain, untyped_schema, false)).string);
+        }
+    }
+    // a union that admits an object already decoded one (upstream); a string-only schema never does
+    const uni = try parseSchema(a, "{\"type\": [\"object\", \"string\"]}");
+    try std.testing.expectEqualStrings("7", (try decode(a, "{\"id\": 7}", uni, false)).object.get("id").?.int);
+    try std.testing.expectEqualStrings("{\"id\": 7}", (try decode(a, "{\"id\": 7}", try parseSchema(a, "{\"type\": \"string\"}"), false)).string);
 }

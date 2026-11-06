@@ -140,16 +140,16 @@ pub const ref_cases = [_]Case{
         .value = "{\"id\": 7}",
         .expected = "{\"request\":{\"id\":7}}",
     },
-    .{
+    .{ // a reference cycle names no kinds: an untyped parameter, so the object the model wrote comes back as one (#180)
         .schema = cycle_schema,
         .defs = cycle_defs,
         .value = "{\"id\": 7}",
-        .expected = "{\"request\":\"{\\\"id\\\": 7}\"}",
+        .expected = "{\"request\":{\"id\":7}}",
     },
-    .{
+    .{ // a definition that is not there names no kinds: untyped, the object stands (#180)
         .schema = missing_schema,
         .value = "{\"id\": 7}",
-        .expected = "{\"request\":\"{\\\"id\\\": 7}\"}",
+        .expected = "{\"request\":{\"id\":7}}",
     },
 };
 
@@ -199,7 +199,7 @@ pub const pointer_defs = "\"$defs\":{\"a~b\":{\"type\":\"object\",\"properties\"
 
 /// The schemas whose references are pointers.
 pub const pointer_cases = [_]Case{
-    .{ .schema = bad_escape_schema, .defs = pointer_defs, .value = "{\"x\": 1}", .expected = "{\"request\":\"{\\\"x\\\": 1}\"}" },
+    .{ .schema = bad_escape_schema, .defs = pointer_defs, .value = "{\"x\": 1}", .expected = "{\"request\":{\"x\":1}}" }, // points nowhere: untyped, the object stands (#180)
     .{ .schema = percent_escape_schema, .defs = pointer_defs, .value = "{\"y\": 2}", .expected = "{\"request\":{\"y\":2}}" },
 };
 
@@ -215,7 +215,9 @@ pub const free_defs = "\"$defs\":{\"Free\":{\"description\":\"anything\"}}";
 /// The schemas whose reference names no kinds, and the ones that name nothing at all.
 pub const unconstrained_cases = [_]Case{
     .{ .schema = typed_free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":{\"a\":1}}" },
-    .{ .schema = free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":\"{\\\"a\\\": 1}\"}" },
-    .{ .schema = cycle_schema, .defs = cycle_defs, .value = "{\"id\": 7}", .expected = "{\"request\":\"{\\\"id\\\": 7}\"}" },
-    .{ .schema = missing_schema, .value = "{\"id\": 7}", .expected = "{\"request\":\"{\\\"id\\\": 7}\"}" },
+    // A schema that names no kinds admits a JSON object or array the model wrote (this recipe's rule, issue #180 of the
+    // 2x DGX Sparks recipe; upstream keeps the text). Scalars and plain text stay text: tool_params' own test.
+    .{ .schema = free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":{\"a\":1}}" },
+    .{ .schema = cycle_schema, .defs = cycle_defs, .value = "{\"id\": 7}", .expected = "{\"request\":{\"id\":7}}" },
+    .{ .schema = missing_schema, .value = "{\"id\": 7}", .expected = "{\"request\":{\"id\":7}}" },
 };

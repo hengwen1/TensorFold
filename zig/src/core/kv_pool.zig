@@ -58,8 +58,9 @@ pub const Budget = struct {
     engine_paged: bool = false,
 };
 
-/// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams.
-pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize };
+/// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams; `skipped`: cache bytes
+/// a family's rule gave the pages instead (native's plan: a device share too small for one of its states).
+pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize, skipped: u64 = 0 };
 
 /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
 pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize, copied: u64 } {

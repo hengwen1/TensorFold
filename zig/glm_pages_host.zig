@@ -228,6 +228,7 @@ test "GLM pages: a failed begin packet cancels its lease and lane before a retry
     var link: glm.follow.Link = undefined;
     link.ids = &.{};
     link.asleep = false;
+    link.keep_pending = null;
     var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
     defer back.deinit();
     var stream = try lanes.Stream.init(t.allocator, .{ .id = "page-test", .prompt = &.{100}, .max_new = 8 });
@@ -241,6 +242,26 @@ test "GLM pages: a failed begin packet cancels its lease and lane before a retry
         try t.expectEqual(@as(usize, 8), f.p.pool.census().free);
         try t.expectEqual(@as(u32, 0), f.e.slot);
         try t.expectEqual(before, F.allocs);
+    }
+}
+
+test "GLM pages: a begin packet the link refuses leaves rank 0's pending keep for the next step" {
+    var f: Fixture = undefined;
+    try f.init(2);
+    defer f.deinit();
+    try f.e.bind(0);
+    f.e.dropped = .empty;
+    f.e.m.glue.put_words = .{ .d = &f.d, .handle = null };
+    var link: glm.follow.Link = undefined;
+    link.ids = &.{};
+    link.asleep = false;
+    link.keep_pending = .{ .slot = 0, .rows = 3 }; // committed on rank 0, not yet sent: it must not be sent or lost
+    const x: glm.follow.Leader = .{ .e = &f.e, .link = &link };
+    for (0..2) |_| {
+        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }));
+        try t.expect(link.keep_pending != null);
+        try t.expectEqual(@as(u32, 0), link.keep_pending.?.slot);
+        try t.expectEqual(@as(u32, 3), link.keep_pending.?.rows);
     }
 }
 

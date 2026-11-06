@@ -57,4 +57,20 @@ __device__ __forceinline__ float block_sum(float acc, float* smem) {
   return r;
 }
 
+// Programmatic dependent launch (sm_90 on; the glue builds native sm_120 SASS only, ACQBULK and PREEXIT there).
+// pdl_wait: until the grids this one depends on have completed and their writes are visible. A kernel launched with
+// the attribute calls it in every thread before any read or write of another grid's data and before any exit, so
+// its own completion still implies its predecessors' (the chain stays ordered when overlap never happens).
+// pdl_trigger: the next grid may launch now; it too waits before it touches anything of ours.
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 }  // namespace glm_triton

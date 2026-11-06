@@ -21,7 +21,7 @@ pub const Header = extern struct {
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
-    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
+    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
     temperature: f64 = 0,
     top_p: f64 = 0,
     min_p: f64 = 0,
@@ -36,6 +36,13 @@ pub const Header = extern struct {
 /// tf_glm_put_words' argument: a step's header (16 words) and up to `put_ids` ids.
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
+/// The first broadcast of every step: the header and its first `put_ids` ids (a decode step's all), one host round trip
+/// on the other ranks; a longer step's ids follow in a second broadcast of the whole message.
+pub const head_bytes = @sizeOf(Words);
+
+/// Header `flags` bit set when the step carries rank 0's last `keep` on the same slot (rows in bits 16-23): the other
+/// ranks commit it before the step, as a separate keep step would have, without its round trip.
+pub const keep_flag: u32 = 1 << 24;
 
 /// The most ids one step carries (a prompt at the engine's capacity).
 pub const Link = struct {
@@ -48,6 +55,7 @@ pub const Link = struct {
     gpa: std.mem.Allocator,
     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
     asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
+    keep_pending: ?struct { slot: u32, rows: u32 } = null, // rank 0: a keep not yet sent (it rides on the next step)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
         const max_ids = @max(asked_ids, prompt_wire.words);
@@ -74,7 +82,8 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
-    /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
+    /// Rank 0: the step and ids to every rank: header and up to `put_ids` ids in one broadcast (by `put`, unwaited),
+    /// a longer step's whole message in a second one after it.
     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
         if (ids.len > l.ids.len) return error.TooManyIds;
         var hh = h;
@@ -88,16 +97,13 @@ pub const Link = struct {
             a.add(@as(u32, @intCast(16 + ids.len)));
             a.add(w);
             try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
-            try l.post(64);
-            if (ids.len > 0) try l.post(64 + ids.len * 4);
-            return;
+            return l.post(head_bytes);
         }
         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
-        try l.bcast(64);
-        if (ids.len > 0) {
-            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
-            try l.bcast(64 + ids.len * 4);
-        }
+        if (ids.len > 0) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
+        try l.post(head_bytes);
+        if (ids.len > put_ids) try l.post(64 + ids.len * 4);
+        try l.stream.synchronize();
     }
 
     /// `bytes` at `ptr` from rank 0 into every rank's `ptr` (image rows: the follower's buffer is the same size).
@@ -106,13 +112,18 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(ptr, ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
-    /// Other ranks: the next step and its ids (valid until the next receive).
+    /// Other ranks: the next step and its ids (valid until the next receive): one host round trip for a step of up to
+    /// `put_ids` ids, two for a longer one.
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
-        try l.bcast(64);
+        try l.bcast(head_bytes);
+        var first: Words = undefined;
+        try l.buf.download(0, std.mem.asBytes(&first));
         var h: Header = undefined;
-        try l.buf.download(0, std.mem.asBytes(&h));
+        @memcpy(std.mem.asBytes(&h), std.mem.sliceAsBytes(first.w[0..16]));
         if (h.n > l.ids.len) return error.TooManyIds;
-        if (h.n > 0) {
+        if (h.n <= put_ids) {
+            @memcpy(l.ids[0..h.n], first.w[16..][0..h.n]);
+        } else {
             try l.bcast(64 + h.n * 4);
             try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
         }
@@ -120,18 +131,28 @@ pub const Link = struct {
     }
 };
 
+/// A prompt step's outcome (Leader.chunk): the first token once it ends the prompt, and the rows it took.
+pub const Chunk = struct { first: ?u32, rows: usize };
+
 /// Rank 0's engine: every step goes to the other ranks first.
 pub const Leader = struct {
     e: *Engine,
     link: *Link,
 
-    /// The step on the bound stream's sequence (its slot) to every rank.
+    /// The step on the bound stream's sequence (its slot) to every rank, with a pending keep on it when it can carry one.
     fn send(x: Leader, h: Header, ids: []const u32) !void {
         var hh = h;
         hh.slot = x.e.slot;
         if (x.link.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
             cuda.tp_watch.wake();
             x.link.asleep = false;
+        }
+        if (ids.len > x.link.ids.len) return error.TooManyIds; // refused whole: a pending keep stays for the next step
+        if (x.link.keep_pending) |kp| {
+            x.link.keep_pending = null;
+            const kind: Kind = @fromBackingInt(@intCast(hh.kind));
+            const rides = kp.slot == hh.slot and kp.rows < 256 and hh.flags & 0xffff_0000 == 0 and (kind == .verify or kind == .block or kind == .draft);
+            if (rides) hh.flags |= keep_flag | (kp.rows << 16) else try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
         }
         try x.link.send(x.e.m.glue.put_words, hh, ids);
     }
@@ -176,6 +197,8 @@ pub const Leader = struct {
     }
 
     /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
+    /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
+    /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
     pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
         try x.flush();
         const c = sampler.check(s);
@@ -189,13 +212,17 @@ pub const Leader = struct {
             h.top_k = v.top_k;
         }
         try x.send(h, pages);
-        try x.e.begin(c);
+        x.e.begin(c) catch |err| {
+            x.send(.{ .kind = @backingInt(Kind.release) }, &.{}) catch |why| std.log.err("slot {d}: the other ranks' release after rank 0's begin failed ({s}): {s}", .{ x.e.slot, @errorName(err), @errorName(why) });
+            return err;
+        };
     }
 
-    /// Every rank's prompt cache at rank 0's budget (snapshots.agree): the others make theirs on this step.
-    pub fn snapshots(x: Leader, budget: u64) !void {
-        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget }, &.{});
-        try @import("cuda_snapshots.zig").agree(x.e, budget);
+    /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
+    /// others make theirs on this step. The pinned bytes each rank holds come back (0: device pages alone).
+    pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
+        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked }, &.{});
+        return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
     }
 
     /// The other ranks make rank 0's pool: `streams` paged sequences and `pages` pages, each page's bytes checked.
@@ -219,15 +246,17 @@ pub const Leader = struct {
         return x.e.prefill(ids, from, cancel, marks);
     }
 
-    /// One chunk of a prompt pass on every rank (Engine.prefillChunk); the first token once the chunk ends the prompt.
-    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
+    /// One prompt step on every rank (Engine.prefillChunk): a chunk, or two when `pair` and Engine.pairedAt allow.
+    pub fn chunk(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
-        const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
-        const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
+        const n: usize = if (pair and x.e.pairedAt(start, ids.len, from, marks)) 2 else 1;
+        const part = ids[start..@min(ids.len, start + n * engine.prompt_rows + 1)];
+        const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
         try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
         x.e.index_split = split;
-        return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        const first = try x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
     }
 
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
@@ -262,9 +291,14 @@ pub const Leader = struct {
         try x.e.prefillMany(parts, firsts);
     }
 
+    /// The other ranks hear the keep with rank 0's next step (Link.keep_flag), or alone before any other step.
     pub fn keep(x: Leader, n: usize) !void {
         try x.flush();
-        try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
+        if (x.link.keep_pending) |kp| { // two keeps in a row: the first goes alone
+            x.link.keep_pending = null;
+            try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
+        }
+        if (n >= 256) try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{}) else x.link.keep_pending = .{ .slot = x.e.slot, .rows = @intCast(n) };
         try x.e.keep(n);
     }
 
@@ -284,12 +318,21 @@ pub const Leader = struct {
 
     /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
     pub fn block(x: Leader, reqs: []dflash.Req) !void {
+        return x.blockStep(reqs, false);
+    }
+
+    /// The kept rows into DFlash2's contexts and no block pass, for streams a copy drafts next (flags 1).
+    pub fn ingest(x: Leader, reqs: []dflash.Req) !void {
+        return x.blockStep(reqs, true);
+    }
+
+    fn blockStep(x: Leader, reqs: []dflash.Req, only_ingest: bool) !void {
         if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
         try x.flush();
         var buf: [3 * dflash.MAX_S]u32 = undefined;
         for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
-        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 3 * reqs.len]);
-        try x.e.draftBlock(reqs);
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len), .flags = @intFromBool(only_ingest) }, buf[0 .. 3 * reqs.len]);
+        if (only_ingest) try x.e.ingestBlock(reqs) else try x.e.draftBlock(reqs);
     }
 
     /// The other ranks leave their loops.
@@ -318,94 +361,118 @@ fn structuredStep(h: Header) bool {
 
 /// A rank other than 0 runs rank 0's steps until it ends; a cancelled prefill is error.Cancelled and the loop goes on.
 pub fn follow(e: *Engine, link: *Link) !void {
-    var drafts: [engine.max_drafts]u32 = undefined;
-    var chances: [engine.max_drafts]f64 = undefined;
-    var sampled: [16]u32 = undefined;
+    var scratch: Scratch = .{};
     cuda.tp_watch.sleep(e.io); // rank 0 starts with no stream: its first step wakes this rank
     while (true) {
         const step = try link.receive();
-        const h = step.h;
-        const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
-        e.prompt_logprobs = if (promptRows(h)) .{} else null;
-        e.structured = structuredStep(h); // rank 0 alone masks them
-        switch (kind) {
-            .begin => {
-                if (step.ids.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, step.ids);
-                try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
-            },
-            .pool => {
-                if (e.pages != null) return error.BadStep;
-                e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
-            },
-            .prefill => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
-                    else => return err,
-                };
-            },
-            .chunk => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                e.index_split = indexSplit(h);
-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
-                    else => return err,
-                };
-            },
-            .verify => try e.verify(step.ids, sampled[0..step.ids.len], 0),
-            .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
-            .shared => {
-                const k = h.depth;
-                if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
-                var parts: [engine.max_shared]engine.Part = undefined;
-                var outs: [engine.shared_rows]u32 = undefined;
-                var at: usize = 2 * k;
-                var row: usize = 0;
-                for (parts[0..k], 0..) |*p, i| {
-                    const n = step.ids[2 * i + 1];
-                    if (at + n > step.ids.len or row + n > outs.len) return error.BadStep;
-                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n], .out = outs[row..][0..n] };
-                    at += n;
-                    row += n;
-                }
-                try e.verifyShared(parts[0..k]);
-            },
-            .many => {
-                var parts: [engine.max_together]engine.Prompt = undefined;
-                const decoded = try prompt_wire.decode(step.ids, h.depth, e.capacity, &parts);
-                var firsts: [engine.max_together]u32 = undefined;
-                try e.prefillMany(decoded, &firsts);
-            },
-            .keep => try e.keep(@intCast(h.a)),
-            .draft => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts, if (h.flags & 2 != 0) &chances else null);
-            },
-            .block => {
-                const k = h.depth;
-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
-                var reqs: [dflash.MAX_S]dflash.Req = undefined;
-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
-                try e.draftBlock(reqs[0..k]);
-            },
-            .image => {
-                const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
-                try v.take(h.slot, step.ids);
-                try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
-            },
-            .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
-            .drop => for (step.ids) |id| e.dropState(id),
-            .release => e.release(h.slot),
-            .idle => cuda.tp_watch.sleep(e.io),
-            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
-        }
+        if (!try apply(e, link, step.h, step.ids, &scratch)) return cuda.tp_watch.ended(); // rank 0 ended on purpose
     }
+}
+
+/// A follower's rows of rank 0's draws, which only rank 0 reads.
+pub const Scratch = struct {
+    drafts: [engine.max_drafts]u32 = undefined,
+    chances: [engine.max_drafts]f64 = undefined,
+    sampled: [16]u32 = undefined,
+};
+
+/// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
+pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scratch) !bool {
+    var h = h_in;
+    const kind: Kind = @fromBackingInt(@intCast(h.kind));
+    if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
+        try e.bind(h.slot);
+        try e.keep((h.flags >> 16) & 0xff);
+        h.flags &= 0xffff;
+    }
+    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
+    e.prompt_logprobs = if (promptRows(h)) .{} else null;
+    e.structured = structuredStep(h); // rank 0 alone masks them
+    switch (kind) {
+        .begin => {
+            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, ids_in);
+            try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
+        },
+        .pool => {
+            if (e.pages != null) return error.BadStep;
+            e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
+        },
+        .prefill => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+            _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
+                error.Cancelled => {},
+                else => return err,
+            };
+        },
+        .chunk => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+            e.index_split = indexSplit(h);
+            _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                error.Cancelled => {},
+                else => return err,
+            };
+        },
+        .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
+            e.discard_draws = true;
+            defer e.discard_draws = false;
+            try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
+            try e.checkGathers(); // no sync now: a peer-store wait the GPU gave up on (this step's or earlier) stops here
+        },
+        .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
+        .shared => {
+            const k = h.depth;
+            if (k == 0 or k > engine.max_shared or ids_in.len < 2 * k) return error.BadStep;
+            var parts: [engine.max_shared]engine.Part = undefined;
+            var outs: [engine.shared_rows]u32 = undefined;
+            var at: usize = 2 * k;
+            var row: usize = 0;
+            for (parts[0..k], 0..) |*p, i| {
+                const n = ids_in[2 * i + 1];
+                if (at + n > ids_in.len or row + n > outs.len) return error.BadStep;
+                p.* = .{ .slot = ids_in[2 * i], .ids = ids_in[at..][0..n], .out = outs[row..][0..n] };
+                at += n;
+                row += n;
+            }
+            e.discard_draws = true;
+            defer e.discard_draws = false;
+            try e.verifyShared(parts[0..k]);
+            try e.checkGathers(); // as for .verify
+        },
+        .many => {
+            var parts: [engine.max_together]engine.Prompt = undefined;
+            const decoded = try prompt_wire.decode(ids_in, h.depth, e.capacity, &parts);
+            var firsts: [engine.max_together]u32 = undefined;
+            try e.prefillMany(decoded, &firsts);
+        },
+        .keep => try e.keep(@intCast(h.a)),
+        .draft => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            try e.draft(h.flags & 1 != 0, ids, h.depth, &s.drafts, if (h.flags & 2 != 0) &s.chances else null);
+        },
+        .block => {
+            const k = h.depth;
+            if (k == 0 or k > dflash.MAX_S or ids_in.len != 3 * k) return error.BadStep;
+            var reqs: [dflash.MAX_S]dflash.Req = undefined;
+            for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = ids_in[3 * i], .pos = 0, .n = ids_in[3 * i + 1], .anchor = ids_in[3 * i + 2] };
+            if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
+        },
+        .image => {
+            const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
+            try v.take(h.slot, ids_in);
+            try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+        },
+        .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+        .drop => for (ids_in) |id| e.dropState(id),
+        .release => e.release(h.slot),
+        .idle => cuda.tp_watch.sleep(e.io),
+        .end => return false, // rank 0 ends on purpose: its line closing from here is expected
+    }
+    return true;
 }
 
 test "a step's header is 64 bytes and keeps its fields" {

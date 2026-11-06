@@ -24,9 +24,11 @@ pub fn passRules(comptime F: type, prompt_rows: u32) api.prompt_cache.Rules {
     return rules;
 }
 
-/// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers).
+/// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers), plus
+/// a host tier the family made beside them (`snap_host_tier`, GLM's pinned pages: its states take them past the card's).
 pub fn cacheBudget(comptime F: type, target: anytype, cache: u64) !u64 {
-    return if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
+    const left = if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
+    return if (@hasDecl(F, "snap_host_tier")) left + F.snap_host_tier(target) else left;
 }
 
 /// The family's `snap_*` copies and `image`, its disk rows (null: none); a container-level value, so the pointer holds.

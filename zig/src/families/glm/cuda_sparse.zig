@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const latent = @import("cuda_latent.zig");
+const index_mod = @import("cuda_index.zig");
 
 /// sparse.POOL, TOPK_POOLS, SELECT_LIST, SCORE_LOOP_FROM, SCORE_LOOP; geometry.MLA_SELECT_ROWS.
 pub const pool = 4;
@@ -20,11 +21,65 @@ fn cdiv(a: usize, b: usize) usize {
 }
 
 /// At most wide_rows rows (one wave on 48 SMs) over wide_pools pools or more: 1,024 threads a row, the same bytes.
-const wide_rows = 48;
+pub const wide_rows = 48;
 const wide_pools = 4096;
 
 fn wideSelect(rows: usize, np: usize) bool {
     return rows <= wide_rows and np >= wide_pools;
+}
+
+/// glm_index_decode.cuh (tf_glm_dsel_scan, tf_glm_dsel_merge): a scan CTA's pools and threads, the candidates a merge
+/// CTA holds, its threads, and the floor's target (speed only: every path picks tf_glm_select_rows' pools).
+pub const dsel_span = 4096;
+pub const dsel_scan_threads = 256;
+pub const dsel_cap = 4096;
+pub const dsel_merge_threads = 1024;
+pub const dsel_target = 2048;
+
+/// TF_GLM_DSEL: unset or 1 (decodeSelect), 0 (tf_glm_select_rows_wide, one CTA a row); a typo is refused.
+pub fn dselParse(text: ?[]const u8) !bool {
+    const t = text orelse return true;
+    if (t.len == 0 or std.mem.eql(u8, t, "1")) return true;
+    if (std.mem.eql(u8, t, "0")) return false;
+    return error.BadDselSetting;
+}
+
+pub fn dselRead() !bool {
+    const v = std.c.getenv("TF_GLM_DSEL") orelse return true;
+    return dselParse(std.mem.span(v));
+}
+
+/// TF_GLM_DSCORES: unset or 1 (decode windows' scores on glm_index_scores), 0 (tf_glm_scores); a typo is refused.
+pub fn dscoresRead() !bool {
+    const v = std.c.getenv("TF_GLM_DSCORES") orelse return true;
+    return dselParse(std.mem.span(v)) catch error.BadDscoresSetting;
+}
+
+/// The bytes of a decode select's gt and eq bit words for `rows` rows at `np` pools (Scratch.ls, its bits_rows).
+pub fn bitsBytes(rows: usize, np: usize) usize {
+    return rows * 2 * cdiv(np, 32) * 4;
+}
+
+/// tf_glm_dsel_scan's grid for `rows` rows from host_pos: the last row's pools (it sees the most) in spans; 0 when every
+/// row fits one merge CTA's candidates (the merge then takes the rows whole and the scan has nothing to mark).
+pub fn dselScanCtas(host_pos: usize, rows: usize, np: usize) usize {
+    const last = @min(np, @max((host_pos + rows) / pool, topk_pools));
+    return if (last <= dsel_cap) 0 else cdiv(last, dsel_span);
+}
+
+/// A decode window's picks (the wide select's rows) on many CTAs: scores [rows][np] at `at` into pools [rows][512].
+/// `path`: 0, or [rows] int32 for each row's path (glm_index_decode.cuh; the checks count them).
+pub fn decodeSelect(set: glue.Set, stream: cuda.Stream, scores: u64, pools: u64, np: usize, at: u64, host_pos: usize, rows: usize, bits: u64, path: u64) !void {
+    const words = cdiv(np, 32);
+    const g = dselScanCtas(host_pos, rows, np);
+    if (g > 0) {
+        var sa: cuda.Args = .{};
+        inline for (.{ scores, @as(i64, @intCast(np)), at, @as(c_int, topk_pools), @as(c_int, dsel_target), bits, @as(i64, @intCast(words)) }) |v| sa.add(v);
+        try cuda.launch.launch(set.glue.dsel_scan, .{ .grid = .{ .x = @intCast(g), .y = @intCast(rows) }, .block = .{ .x = dsel_scan_threads } }, stream, &sa);
+    }
+    var ma: cuda.Args = .{};
+    inline for (.{ scores, pools, @as(i64, @intCast(np)), at, @as(c_int, topk_pools), bits, @as(i64, @intCast(words)), path }) |v| ma.add(v);
+    try cuda.launch.launch(set.glue.dsel_merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = dsel_merge_threads } }, stream, &ma);
 }
 
 /// sparse.index_update: the window's LayerNormed index keys and gates into ik and ig at pos, completed pools into pk.
@@ -55,7 +110,8 @@ pub fn headScale(heads: usize) f32 {
 }
 
 /// The scratch of one selectTokens: scores fp32 [min(rows, 512)][np], and with np past select_list the list rows.
-pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64 };
+/// `ls` also holds a decode select's bit words (bitsBytes) for up to `bits_rows` rows; 0: none (the wide select).
+pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64, bits_rows: usize = 0 };
 
 /// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered.
 pub const Split = struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize };
@@ -65,7 +121,8 @@ pub fn splitAt(start: usize, from: usize, world: usize) bool {
     return from > 0 and world > 1 and start >= from;
 }
 
-/// sparse.select_tokens: rows' tokens (i32 [rows][width], ascending, -1 padded; on pages their rows); count 0 if dense.
+/// sparse.select_tokens: rows' tokens (i32 [rows][width], ascending, -1 padded; on pages their rows unless `t.logical`);
+/// count 0 if dense. The pooled keys are read through `t.pt` either way.
 pub fn selectTokens(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, t: latent.Table, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, np_max_cap: usize, s: Scratch, tokens: u64, counts: u64) !void {
     return selectTokensProfile(set, ops, stream, qi, wts, w_stride, pk, t, pos, host_pos, rows, heads, d, np_max_cap, s, tokens, counts, null, null);
 }
@@ -98,8 +155,10 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
         inline for (.{ qi + a * heads * d * 2, wts + a * w_stride * 2, @as(i64, @intCast(w_stride)), pk, s.scores, at, @as(i64, @intCast(np_max)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), t.pt, @as(i64, @intCast(t.ps)) }) |v| sa.add(v);
         if (d != 128 or heads > 32) return error.IndexShape;
         const quick = if (set.index) |k| if (k.takes(rows, np_max, pk, t.ps)) k else null else null;
+        // a decode window's rows: the same scores from glm_index_scores (8 rows a CTA, key tiles staged once)
+        const dec = if (set.dscore) |k| if (k.takesDecode(rows, np_max, nb, pk, t.ps)) k else null else null;
         var stamp = prof.span(profile, stream, .index_score);
-        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else if (dec) |k| try k.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, index_mod.decodeLoop(nb)) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
         stamp.end();
         stamp = prof.span(profile, stream, .index_select);
         if (quick) |k| if (k.select) {
@@ -107,9 +166,14 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
             stamp.end();
             continue;
         };
+        const wide = wideSelect(n, np_max);
+        if (wide and set.dsel and n <= s.bits_rows) {
+            try decodeSelect(set, stream, s.scores, s.pools + a * topk_pools * 8, np_max, at, host_pos + a, n, s.ls, 0);
+            stamp.end();
+            continue;
+        }
         var sel: cuda.Args = .{};
         inline for (.{ s.scores, s.pools + a * topk_pools * 8, @as(i64, @intCast(np_max)), at, @as(c_int, topk_pools) }) |v| sel.add(v);
-        const wide = wideSelect(n, np_max);
         try cuda.launch.launch(if (wide) set.glue.select_rows_wide else set.glue.select_rows, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = if (wide) 1024 else 128 } }, stream, &sel);
         stamp.end();
     }
@@ -126,7 +190,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
     args.add(@as(c_int, topk_pools));
     args.add(tokens);
     args.add(counts);
-    args.add(t.pt);
+    args.add(if (t.logical) @as(u64, 0) else t.pt); // an E4M3 cache's lists stay positions; its chunks take the table
     args.add(@as(i64, @intCast(t.page_rows)));
     try cuda.launch.launch(assemble, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
 }
@@ -138,6 +202,25 @@ test "sparse.py's sizing rules" {
     try std.testing.expectEqual(@as(usize, 1250), scoreColumns(5000, 1, 2048));
     try std.testing.expectEqual(@as(usize, 2051), width);
     try std.testing.expectEqual(@as(f32, @floatCast(1.0 / 5.656854249492381)), headScale(32));
+}
+
+test "GLM index: TF_GLM_DSEL is on unless 0, and a typo is refused" {
+    try std.testing.expect(try dselParse(null));
+    try std.testing.expect(try dselParse(""));
+    try std.testing.expect(try dselParse("1"));
+    try std.testing.expect(!try dselParse("0"));
+    try std.testing.expectError(error.BadDselSetting, dselParse("on"));
+}
+
+test "GLM index: a decode select's scan covers the last row's pools in spans, and none when the merge takes rows whole" {
+    // 864K: the last row sees 216,064 pools of a 216,080 bucket
+    try std.testing.expectEqual(@as(usize, 53), dselScanCtas(864256 - 16, 16, 216080));
+    try std.testing.expectEqual(@as(usize, 8), dselScanCtas(131072 - 1, 1, 65536)); // 32,768 visible of 65,536
+    try std.testing.expectEqual(@as(usize, 0), dselScanCtas(4 * 4096 - 1, 1, 8192)); // 4,096 pools: one merge CTA
+    try std.testing.expectEqual(@as(usize, 2), dselScanCtas(4 * 4096 + 3, 1, 8192));
+    try std.testing.expectEqual(@as(usize, 0), dselScanCtas(100, 1, 4096)); // a few visible: K pools
+    try std.testing.expect(dsel_span % (32 * (dsel_scan_threads / 32)) == 0); // whole words for every warp
+    try std.testing.expectEqual(@as(usize, 16 * 2 * 6753 * 4), bitsBytes(16, 216080));
 }
 
 test "rank 0 splits a prompt chunk's indexer rows from TF_GLM_INDEX_SPLIT's position on, over two ranks or more" {

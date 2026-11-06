@@ -9,7 +9,7 @@ const sparse = @import("cuda_sparse.zig");
 /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart.
 pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0 };
 pub const Plan = struct {
-    parts: [5 * (@import("config.zig").max_layers + 1) + 2]Part = undefined,
+    parts: [5 * (@import("config.zig").max_layers + 1) + 3]Part = undefined, // and one outside the arena (`outside`)
     count: usize = 0,
     len: usize = 0,
     ids: []const u32 = &.{}, // a paged sequence's pages in row order
@@ -51,8 +51,10 @@ pub const Plan = struct {
         const latent = try std.math.mul(usize, at, @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1));
         const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
-        try p.addCache(st, x, x.lc, latent, page_rows * @as(usize, c.kv_lora) * 2);
-        if (x.ls != 0) try p.add(st, x.ls, try std.math.mul(usize, at, @sizeOf(f32)));
+        const latent_row = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1);
+        try p.addCache(st, x, x.lc, latent, page_rows * latent_row);
+        // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
+        if (x.ls != 0) try p.addCache(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
         try p.add(st, st.rings[2 * j], ring);
         try p.add(st, st.rings[2 * j + 1], ring);
         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);
@@ -65,6 +67,15 @@ pub const Plan = struct {
         if ((!p.sizing and (len - 1) / span >= p.ids.len) or p.count == p.parts.len) return error.SnapshotShape;
         p.len = try std.math.add(usize, p.len, len);
         p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.ps };
+        p.count += 1;
+    }
+
+    /// `len` bytes the sequence's arena does not hold (DFlash2's context ring for the slot), after every arena part.
+    pub fn outside(p: *Plan, live: u64, len: usize) !void {
+        if (len == 0) return;
+        if (live == 0 or p.count == p.parts.len) return error.SnapshotShape;
+        p.len = try std.math.add(usize, p.len, len);
+        p.parts[p.count] = .{ .live = live, .len = len };
         p.count += 1;
     }
 

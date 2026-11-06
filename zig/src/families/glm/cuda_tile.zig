@@ -98,7 +98,17 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     defer list.deinit(w.gpa);
     try linears(w, &list);
     var most: usize = 0;
-    for (list.items) |e| most = @max(most, e.n * e.k * 2);
+    var plain_bytes: usize = 0; // TF_GLM_MM_CUBLAS: every linear's row-major bf16 copy, one arena
+    for (list.items) |e| {
+        most = @max(most, e.n * e.k * 2);
+        plain_bytes += e.n * e.k * 2;
+    }
+    const cublas = mm_mod.cublasEnabled();
+    var plain: ?cuda.DeviceBuffer = if (cublas and plain_bytes > 0) try cuda.DeviceBuffer.alloc(d, plain_bytes) else null;
+    errdefer if (plain) |*b| b.free();
+    var plain_at: usize = 0;
+    var plain_ptrs: std.ArrayList(u64) = .empty;
+    errdefer plain_ptrs.deinit(gpa);
     var tmp = try cuda.DeviceBuffer.alloc(d, most);
     defer tmp.free();
     errdefer @import("cuda_load_owner.zig").drain(s, d);
@@ -119,6 +129,11 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
         const ptr = e.field.*;
         const bits = if (i + 1 == list.items.len and w.head == .bf16) head_bits else dense_bits; // an MXFP8 head stays
         if (bits == 16) {
+            if (plain) |pl| { // its rows, as cuBLASLt reads them, before the tiling overwrites them
+                try d.check(d.api.cuMemcpyDtoDAsync_v2(pl.ptr + plain_at, ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
+                try plain_ptrs.append(gpa, pl.ptr + plain_at);
+                plain_at += n * k * 2;
+            }
             try mm_mod.tile(mk, s, ptr, tmp.ptr, n, k);
             try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
             continue;
@@ -126,6 +141,11 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
         try host.resize(gpa, n * k);
         try s.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
+        if (plain) |pl| { // the same rows into the arena, as a row-major bf16 [n][k] matrix
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(pl.ptr + plain_at, @ptrCast(host.items.ptr), n * k * 2, s.handle), "cuMemcpyHtoDAsync");
+            try plain_ptrs.append(gpa, pl.ptr + plain_at);
+            plain_at += n * k * 2;
+        }
         try words.resize(gpa, n * k * bits / 32);
         try scales.resize(gpa, n * (k / 64));
         qpack.quantize(bits, host.items, n, k, words.items, scales.items);
@@ -141,22 +161,28 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     try s.synchronize();
     if (packed_ptrs.items.len > 0) std.log.info("glm: {d} linears packed ({d}/{d} bits), {d:.2} GiB freed", .{ packed_ptrs.items.len, dense_bits, head_bits, @as(f64, @floatFromInt(freed)) / (1 << 30) });
     // sorted by pointer, the bits beside them (Packed.tiled searches)
+    if (plain) |pl| try w.buffers.append(gpa, pl); // owned with the weights; freed by the model's teardown
+    plain = null; // the weights own it now
     const ptrs = try packed_ptrs.toOwnedSlice(gpa);
     errdefer gpa.free(ptrs);
     const bits_out = try packed_bits.toOwnedSlice(gpa);
+    const plains = try plain_ptrs.toOwnedSlice(gpa);
+    errdefer gpa.free(plains);
     const Ctx = struct {
         p: []u64,
         b: []u8,
+        pl: []u64,
         pub fn lessThan(c: @This(), a: usize, b: usize) bool {
             return c.p[a] < c.p[b];
         }
         pub fn swap(c: @This(), a: usize, b: usize) void {
             std.mem.swap(u64, &c.p[a], &c.p[b]);
             std.mem.swap(u8, &c.b[a], &c.b[b]);
+            if (a < c.pl.len and b < c.pl.len) std.mem.swap(u64, &c.pl[a], &c.pl[b]);
         }
     };
-    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out });
-    return .{ .ptrs = ptrs, .bits = bits_out };
+    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out, .pl = plains });
+    return .{ .ptrs = ptrs, .bits = bits_out, .plain = plains };
 }
 
 test "GLM TP3: the tiler keeps unsupported KDA input and view weights in row-major order" {

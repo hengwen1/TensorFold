@@ -69,6 +69,10 @@ pub fn toolHostTests(b: *std.Build, parser: *std.Build.Module, server: *std.Buil
     const http = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"tool visibility HTTP:"} }));
     http.has_side_effects = true;
     b.step("test-tool-visibility-http-host", "Rejected tool envelopes survive actual chat JSON and SSE replies").dependOn(&http.step);
+    const json_answer = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"JSON answer:"} }));
+    json_answer.has_side_effects = true;
+    all.dependOn(&json_answer.step);
+    b.step("test-json-answer-host", "A JSON answer stays JSON beside offered tools, in actual chat JSON and SSE replies").dependOn(&json_answer.step);
     const deepseek = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"DeepSeek chat:"} }));
     deepseek.has_side_effects = true;
     all.dependOn(&deepseek.step);

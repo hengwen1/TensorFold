@@ -426,8 +426,69 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
     step_kernel_body<8, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
 }
 
+// The same step with 4 and 2 warps a block (256 and 512 blocks a layer for 32 heads instead of 128): every warp keeps its
+// 4 value rows and its arithmetic, so y and the state are the same bits; small windows spread over more SMs (cuda_kda).
+extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_step4(
+        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
+        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
+        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    step_kernel_body<4, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
+extern "C" __global__ void __launch_bounds__(64) tf_glm_kda_step2(
+        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
+        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
+        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    step_kernel_body<2, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
 extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
     out_kernel_body(H, y_in, G, g_stride, norm_w, eps, out);
+}
+
+// A shared window's KDA layer with every segment (stream) in one launch: z picks the segment, and each block is the
+// block that segment's own tf_glm_kda_prep / _step / _out launch runs, on its rows, states and saves (their q and y
+// rows at the segment's own offset in the window's scratch), so the bits are the per-segment launches'.
+struct KdaSeg {
+    const __nv_bfloat16* P;   // the segment's projection rows (the stream's copy)
+    const __nv_bfloat16* A;   // its decay rows
+    const __nv_bfloat16* G;   // its gate rows
+    const __nv_bfloat16* cs;  // the stream's conv window
+    const float* state_in;
+    float* state_out;
+    float* q;                 // the window's q scratch from the segment's first row
+    float* k_save;
+    __nv_bfloat16* v_save;
+    float* g_save;
+    float* b_save;
+    __nv_bfloat16* y;         // the read-out scratch from the segment's first row
+    __nv_bfloat16* out;       // the window's out rows from the segment's first row
+    int rows;
+};
+constexpr int KDA_SEGS = 16;  // Engine.max_shared
+struct KdaSegs {
+    KdaSeg s[KDA_SEGS];
+};
+
+extern "C" __global__ void __launch_bounds__(512) tf_glm_kda_prep_segs(
+        int H, int p_stride, int b_off, int a_stride, const float* __restrict__ cw, const float* __restrict__ a_log,
+        const float* __restrict__ dt_bias, float lower, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    if (static_cast<int>(blockIdx.x) >= g.rows) return;  // the segment's own grid is its rows
+    prep_kernel_body(H, g.P, p_stride, b_off, g.A, a_stride, g.cs, cw, a_log, dt_bias, lower, g.q, g.k_save, g.v_save,
+                     g.g_save, g.b_save);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step_segs(int H, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    step_kernel_body<8, 16>(H, g.state_in, g.q, g.k_save, g.v_save, g.g_save, g.b_save, g.rows, g.y, g.state_out);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out_segs(
+        int H, int g_stride, const __nv_bfloat16* __restrict__ norm_w, float eps, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    if (static_cast<int>(blockIdx.x) >= g.rows) return;
+    out_kernel_body(H, g.y, g.G, g_stride, norm_w, eps, g.out);
 }

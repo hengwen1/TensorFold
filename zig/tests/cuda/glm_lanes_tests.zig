@@ -42,7 +42,7 @@ pub fn coverCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
-    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .mtp = true, .settings = set });
+    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .drafts = true, .settings = set });
     defer e.deinit();
     try e.prepareSnapshots(2 * e.stateBytes(4096));
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, dc.capacity);
@@ -151,7 +151,7 @@ pub fn concurrentCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, ra
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
-    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .mtp = true, .settings = set });
+    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .drafts = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, dc.capacity);
     defer link.deinit();
@@ -226,11 +226,13 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
     const comm = try openComm(gpu, &lib, rank, world, id_path);
     defer _ = lib.api.ncclCommDestroy(comm);
     var problem: []const u8 = "";
-    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
+    var set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
-    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .mtp = true, .settings = set });
+    set.kv8 = sharedEnvIs("TF_GLM_CHECK_KV8", "1"); // as --kv-cache fp8 (glm-pair-check's switch)
+    set.pages = sharedEnvIs("TF_KV_PAGES", "on"); // as the server's TF_KV_PAGES=on: every stream on pages
+    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .drafts = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, dc.capacity);
     defer link.deinit();
@@ -245,13 +247,28 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
     const V = e.share.vocab.len();
     var failed = false;
     var first: [S]u32 = undefined;
+    if (set.pages) { // every stream and twin on pages of one pool, as the server runs them
+        const P = glm.pages;
+        const l = try P.layout(gpu.gpa, e, 0);
+        const count = 2 * S * P.tableLen(dc.capacity) + 3;
+        try x.pool(2 * S, count, l.pageBytes());
+        e.pages = try P.Pages.init(gpu.gpa, e, l, 2 * S, count, true);
+        e.pages.?.poison = true; // a row read before its write turns the reply to NaN
+    }
     for (0..2 * S) |slot| {
         const i = slot % S;
         const k = dc.kinds[i % dc.kinds.len];
         const ids = try a.alloc(u32, k.prompt.len);
         for (ids, k.prompt) |*u, v| u.* = @intCast(v);
-        try x.bind(@intCast(slot));
-        try x.begin(if (i == S - 1) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null);
+        const sampling: ?glm.sampler.Sampling = if (i == S - 1) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null;
+        if (set.pages) {
+            const held = try e.pages.?.open(@intCast(slot), ids.len + 512, 64); // the prompt and every round's rows
+            try x.bind(@intCast(slot));
+            try x.beginOn(sampling, held);
+        } else {
+            try x.bind(@intCast(slot));
+            try x.begin(sampling);
+        }
         const t = try x.prefill(ids, null, null, null);
         if (slot >= S and t != first[i]) {
             std.debug.print("FAIL shared: stream {d}'s twin drew {d} from the prompt, the stream {d}\n", .{ i, t, first[i] });
@@ -305,6 +322,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         }
     }
     try e.stream.synchronize();
+    var pages_compared: usize = 0;
     for (0..S) |i| { // the whole states after every round's commit
         const st = &e.seqs.items[i].?.st;
         const tw = &e.seqs.items[S + i].?.st;
@@ -313,14 +331,39 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         const h1 = try a.alloc(u8, len);
         try st.arena.buf.download(0, h0);
         try tw.arena.buf.download(0, h1);
-        const at = std.mem.indexOfDiff(u8, h0, h1);
+        // on pages the arena's last piece is the page table, whose ids differ (a stream and its twin lease different
+        // pages of the pool): the arena up to it, then the pages themselves below
+        const end: usize = if (set.pages) @intCast(st.table - st.arena.buf.ptr) else len;
+        const at = std.mem.indexOfDiff(u8, h0[0..end], h1[0..end]);
         if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or !std.mem.eql(u1, st.cur, tw.cur) or at != null) {
-            std.debug.print("FAIL shared: stream {d}'s state differs from its twin's (pos {d}/{d}, first byte {?d} of {d})\n", .{ i, st.pos, tw.pos, at, len });
+            std.debug.print("FAIL shared: stream {d}'s state differs from its twin's (pos {d}/{d}, first byte {?d} of {d})\n", .{ i, st.pos, tw.pos, at, end });
             failed = true;
         }
+        if (!set.pages) continue;
+        // every page of the stream's against its twin's at the same table index: the KV rows (E4M3 codes and scales
+        // or bf16, pooled keys, the MTP head's part) and the tails, which both pools' poison filled alike
+        const pg = e.pages.?;
+        const page: usize = @intCast(pg.layout.pageBytes());
+        if (st.pages.len == 0 or st.pages.len != tw.pages.len) {
+            std.debug.print("FAIL shared: stream {d} holds {d} pages, its twin {d}\n", .{ i, st.pages.len, tw.pages.len });
+            failed = true;
+            continue;
+        }
+        const p0 = try a.alloc(u8, page);
+        const p1 = try a.alloc(u8, page);
+        for (st.pages, tw.pages, 0..) |id0, id1, j| {
+            try pg.arena.?.download(@as(usize, id0) * page, p0);
+            try pg.arena.?.download(@as(usize, id1) * page, p1);
+            if (std.mem.indexOfDiff(u8, p0, p1)) |off| {
+                std.debug.print("FAIL shared: stream {d}'s page {d} (id {d}) differs from its twin's (id {d}) from byte {d} of {d}\n", .{ i, j, id0, id1, off, page });
+                failed = true;
+                break;
+            }
+        }
+        pages_compared += st.pages.len;
     }
     if (failed) return error.TestFailed;
-    check.pass("shared windows at TP={d}: {d} rows of {d} streams over 12 rounds (2 to {d} streams a forward, 1 to 4 rows each, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's", .{ world, compared, S, S });
+    check.pass("shared windows at TP={d} ({s}): {d} rows of {d} streams over 12 rounds (2 to {d} streams a forward, 1 to 4 rows each, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's ({d} pages each against its twin's)", .{ world, if (!set.pages) "windows" else if (set.kv8) "E4M3 KV pages" else "bf16 KV pages", compared, S, S, pages_compared });
 }
 
 /// A concurrent case's stream: prompt `p` joining at round `at`; `filled`: its prompt a chunk at a time between rounds.
@@ -473,4 +516,9 @@ const Cover = struct {
 fn seconds(io: std.Io, since: std.Io.Timestamp) f64 {
     const now = std.Io.Clock.awake.now(io);
     return @as(f64, @floatFromInt(now.toNanoseconds() - since.toNanoseconds())) / 1e9;
+}
+
+fn sharedEnvIs(name: [*:0]const u8, want: []const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), want);
 }

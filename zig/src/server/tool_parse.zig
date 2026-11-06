@@ -121,38 +121,96 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
-        const parsed: ?[]Call = blk: {
-            if (tool_dsml.whole(env.payload)) |b| {
-                break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Invalid => null,
-                };
+        var start = env.start;
+        var parsed = try offeredCalls(a, env.payload, &schemas, &known, max_calls != null);
+        // Prose that quotes the opener ("Qwen's <tool_call>{}") ahead of a call begins the envelope, so the call does
+        // not parse as its payload: the call is the last opener inside it (or one before that, when a value quotes
+        // the opener too), and the quoting prose stays content.
+        // An opener inside an unclosed value of the text before it (a JSON object still open, an <arg_value> or
+        // <parameter=> not yet closed) is a quoted call inside a call the first closer cut: never the call.
+        if (parsed == null and std.ascii.startsWithIgnoreCase(text[env.start..], "<tool_call>")) {
+            const closer = env.end - "</tool_call>".len;
+            var inner = lastOpener(text, env.start + "<tool_call>".len, closer);
+            var tries: usize = 0;
+            while (inner) |s| : (inner = lastOpener(text, env.start + "<tool_call>".len, s)) {
+                tries += 1;
+                if (tries > inner_tries) break;
+                if (insideValue(text[env.start + "<tool_call>".len .. s])) continue;
+                parsed = try offeredCalls(a, strip(text[s + "<tool_call>".len .. closer]), &schemas, &known, max_calls != null);
+                if (parsed != null) {
+                    start = s;
+                    break;
+                }
             }
-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Invalid => break :blk null,
-            };
-            if (one) |c| {
-                const list = try a.alloc(Call, 1);
-                list[0] = c;
-                break :blk list;
-            }
-            break :blk null;
-        };
-        const good = if (parsed) |list| list.len > 0 and for (list) |c| {
-            if ((try callName(a, c, &known)) == null) break false;
-        } else true else false;
-        if (!good) {
+        }
+        const list = parsed orelse {
             try residue.appendSlice(a, text[env.start..env.end]);
             rejected += 1;
             continue;
-        }
-        for (parsed.?) |c| {
+        };
+        try residue.appendSlice(a, text[env.start..start]);
+        for (list) |c| {
             if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);
     return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected };
+}
+
+/// Openers inside a rejected envelope tried, from the last: a bound keeps a reply of quoted openers linear.
+const inner_tries = 4;
+
+/// Whether an opener after `before` would lie inside a value still open in `before`: a JSON object with more `{`
+/// than `}`, an <arg_value> without its </arg_value>, or a <parameter=...> without its </parameter>.
+fn insideValue(before: []const u8) bool {
+    var depth: isize = 0;
+    for (before) |ch| {
+        if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
+    }
+    if (depth > 0) return true;
+    const open_value = std.mem.lastIndexOf(u8, before, "<arg_value>");
+    if (open_value) |o| if (std.mem.lastIndexOf(u8, before, "</arg_value>")) |c| {
+        if (c < o) return true;
+    } else return true;
+    const open_param = std.mem.lastIndexOf(u8, before, "<parameter=");
+    if (open_param) |o| if (std.mem.lastIndexOf(u8, before, "</parameter>")) |c| {
+        if (c < o) return true;
+    } else return true;
+    return false;
+}
+
+/// The last ``<tool_call>`` that starts at or after ``from`` and ends by ``before``.
+fn lastOpener(text: []const u8, from: usize, before: usize) ?usize {
+    var last: ?usize = null;
+    var pos = from;
+    while (findCI(text[0..before], "<tool_call>", pos)) |s| : (pos = s + 1) last = s;
+    return last;
+}
+
+/// A payload's calls when it parses whole and each names an offered tool; null when it is not such a call.
+fn offeredCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!?[]Call {
+    const parsed: ?[]Call = blk: {
+        if (tool_dsml.whole(block)) |b| {
+            break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => null,
+            };
+        }
+        const one = payload(a, block, schemas, complete) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => break :blk null,
+        };
+        if (one) |c| {
+            const list = try a.alloc(Call, 1);
+            list[0] = c;
+            break :blk list;
+        }
+        break :blk null;
+    };
+    const list = parsed orelse return null;
+    if (list.len == 0) return null;
+    for (list) |c| if ((try callName(a, c, known)) == null) return null;
+    return list;
 }
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``

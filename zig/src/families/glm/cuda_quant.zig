@@ -7,12 +7,14 @@ pub const Kernels = struct {
     amax: cuda.Function,
     nvfp4: cuda.Function,
     q4: cuda.Function,
+    q4g32: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         return .{
             .amax = try m.function("tf_glm_nvfp4_amax"),
             .nvfp4 = try m.function("tf_glm_nvfp4_quantize"),
             .q4 = try m.function("tf_glm_quantize4"),
+            .q4g32 = try m.function("tf_glm_quantize4_32"),
         };
     }
 };
@@ -54,4 +56,18 @@ pub fn q4(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, w
     a.add(scales);
     a.add(biases);
     try cuda.launch.launch(ks.q4, .{ .grid = .{ .x = blocks(groups) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+/// qmm.quantize4 at 32 groups (TF_GLM_DFLASH2_Q32): the same stores, scales and biases [n][k/32].
+pub fn q4g32(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, words: u64, scales: u64, biases: u64) !void {
+    if (k % 32 != 0) return error.KNotMultipleOf64;
+    const groups: u64 = @as(u64, n) * k / 32;
+    if (groups == 0) return;
+    var a: cuda.Args = .{};
+    a.add(w);
+    a.add(@as(c_longlong, @intCast(groups)));
+    a.add(words);
+    a.add(scales);
+    a.add(biases);
+    try cuda.launch.launch(ks.q4g32, .{ .grid = .{ .x = blocks(groups) }, .block = .{ .x = 256 } }, stream, &a);
 }

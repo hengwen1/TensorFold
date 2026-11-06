@@ -58,6 +58,134 @@ extern "C" __global__ void __launch_bounds__(32)
   }
 }
 
+// tf_glm_index_write's and tf_glm_pool_keys' code (word for word) for the segment-batched launches: the row, or the
+// pool block, within its segment comes in (rr, bx) instead of blockIdx.x.
+namespace glm_idxw {
+__device__ __forceinline__ void index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr,
+                                            const __nv_bfloat16* lnw, const __nv_bfloat16* lnb, __nv_bfloat16* ik,
+                                            __nv_bfloat16* ig, const int* pos, float eps, int64_t r) {
+  constexpr int D = 128;
+  const int64_t at = (int64_t)pos[0] + r;
+  const int d0 = threadIdx.x * 4;
+  float x[4];
+  for (int j = 0; j < 4; ++j) x[j] = bf(kr[r * k_stride + d0 + j]);
+  float s = x[0] + x[1];
+  s = x[2] + s;
+  s = x[3] + s;
+  for (int o = 16; o > 0; o >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, o);
+  const float mean = div_full(s, (float)D);
+  float xc[4];
+  for (int j = 0; j < 4; ++j) xc[j] = __fsub_rn(x[j], mean);  // sub.rn in Triton: never contracted
+  float v = fmul(xc[1], xc[1]);
+  v = __fmaf_rn(xc[0], xc[0], v);
+  v = __fmaf_rn(xc[2], xc[2], v);
+  v = __fmaf_rn(xc[3], xc[3], v);
+  for (int o = 16; o > 0; o >>= 1) v = v + __shfl_xor_sync(0xffffffffu, v, o);
+  const float sd = sqrt_approx(fadd(eps, div_full(v, (float)D)));
+  for (int j = 0; j < 4; ++j) {
+    const int d = d0 + j;
+    ik[at * D + d] = __float2bfloat16_rn(__fmaf_rn(div_full(xc[j], sd), bf(lnw[d]), bf(lnb[d])));
+    ig[at * D + d] = __float2bfloat16_rn(gr[r * D + d]);
+  }
+}
+
+__device__ __forceinline__ void pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
+                                          __nv_bfloat16* pk, const int* pos, int64_t rows, const int* pt, int64_t ps,
+                                          int64_t bx) {
+  constexpr int D = 128;
+  const int64_t P = pos[0], p = P / 4 + bx;
+  if (4 * p + 3 > P + rows - 1) return;
+  __nv_bfloat16* out = pk + glm_pages::at<128>(pt, ps / 2, p, D);  // a page holds 512 rows' 128 pools
+  for (int j = 0; j < 4; ++j) {
+    const int d = threadIdx.x * 4 + j;
+    float l[4], e[4];
+    for (int q = 0; q < 4; ++q) l[q] = bf(ig[(4 * p + q) * D + d]) + bf(ape[q * D + d]);
+    const float m = fmaxf(fmaxf(l[0], l[1]), fmaxf(l[2], l[3]));
+    for (int q = 0; q < 4; ++q) e[q] = exp_approx(l[q] - m);
+    const float s = ((e[0] + e[1]) + e[2]) + e[3];
+    float t = 0.0f;
+    for (int q = 0; q < 4; ++q) {
+      const float tq = rbf(__fmul_rn(rbf(div_full(e[q], s)), bf(ik[(4 * p + q) * D + d])));
+      t = q == 0 ? tq : t + tq;
+    }
+    out[d] = __float2bfloat16_rn(t);
+  }
+}
+
+}  // namespace glm_idxw
+
+// A shared decode window's cache writes with every segment (stream) in one launch each: its latent rows into the
+// stream's E4M3 pages (tf_glm_lat_write_fp8_paged's code), its index keys and gates (tf_glm_index_write's), and its
+// completed pools (tf_glm_pool_keys'), each block running the block its segment's own launch ran (the row, or the
+// pool block, within the segment; the segment's rows and position and the stream's caches), so the same bytes.
+namespace glm_wsegs {
+struct Seg {
+  const __nv_bfloat16* lat;  // the segment's latent rows (its first row)
+  unsigned char* cache;      // the stream's E4M3 latent cache (this layer's place in page 0) and its scales
+  float* scales;
+  const __nv_bfloat16* kr;   // the segment's raw index keys and gate rows (its first row)
+  const float* gr;
+  __nv_bfloat16* ik;         // the stream's index keys, gates and pooled keys
+  __nv_bfloat16* ig;
+  __nv_bfloat16* pk;
+  const int* pos;            // the stream's position on the device
+  const int* pt;             // the stream's page table
+  int rows;
+  int row0;                  // the segment's first row in the window
+  int b0;                    // its first pool block (rows / 4 + 2 a segment)
+};
+constexpr int SEGS = 16;  // Engine.max_shared
+struct Segs {
+  Seg s[SEGS];
+  int n;
+};
+__device__ __forceinline__ const Seg& by_row(const Segs& t, int row) {
+  int k = 0;
+  while (k + 1 < t.n && row >= t.s[k + 1].row0) ++k;
+  return t.s[k];
+}
+__device__ __forceinline__ const Seg& by_block(const Segs& t, int b) {
+  int k = 0;
+  while (k + 1 < t.n && b >= t.s[k + 1].b0) ++k;
+  return t.s[k];
+}
+}  // namespace glm_wsegs
+
+// x: the window's rows
+extern "C" __global__ void __launch_bounds__(512)
+    tf_glm_lat_write_fp8_paged_segs(int64_t stride, int64_t ps, const glm_wsegs::Segs t) {
+  const glm_wsegs::Seg& g = glm_wsegs::by_row(t, static_cast<int>(blockIdx.x));
+  glm_latw::write_fp8_paged(g.lat, stride, g.cache, g.scales, g.pos, g.pt, ps, static_cast<int64_t>(blockIdx.x) - g.row0);
+}
+// x: the window's rows
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_index_write_segs(int64_t k_stride, const __nv_bfloat16* lnw, const __nv_bfloat16* lnb, float eps,
+                            const glm_wsegs::Segs t) {
+  const glm_wsegs::Seg& g = glm_wsegs::by_row(t, static_cast<int>(blockIdx.x));
+  glm_idxw::index_write(g.kr, k_stride, g.gr, lnw, lnb, g.ik, g.ig, g.pos, eps, static_cast<int64_t>(blockIdx.x) - g.row0);
+}
+// x: every segment's rows / 4 + 2 pool blocks in turn
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys_segs(const __nv_bfloat16* ape, int64_t ps, const glm_wsegs::Segs t) {
+  const glm_wsegs::Seg& g = glm_wsegs::by_block(t, static_cast<int>(blockIdx.x));
+  glm_idxw::pool_keys(g.ik, g.ig, ape, g.pk, g.pos, g.rows, g.pt, ps, static_cast<int64_t>(blockIdx.x) - g.b0);
+}
+
+// Several 16-byte-aligned copies in one launch (y: the copy): a shared window's KDA projection rows into each stream.
+struct tf_glm_copy {
+  const uint4* src;
+  uint4* dst;
+  int64_t n;  // 16-byte units
+};
+struct tf_glm_copies {
+  tf_glm_copy c[16];
+};
+extern "C" __global__ void __launch_bounds__(256) tf_glm_copy_segs(const tf_glm_copies t) {
+  const tf_glm_copy& c = t.c[blockIdx.y];
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < c.n; i += (int64_t)gridDim.x * blockDim.x)
+    c.dst[i] = c.src[i];
+}
+
 namespace glm_index {
 
 // sparse._order_key: a score's bits as a uint32 whose unsigned order is the scores' (-0 counted as +0).

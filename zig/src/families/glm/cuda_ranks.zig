@@ -15,11 +15,13 @@ pub const Settings = struct {
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
+    pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -48,6 +50,12 @@ pub const Settings = struct {
         if (get("TF_GLM_KDA_DECODE_WIDE")) |v| {
             if (std.mem.eql(u8, v, "1")) s.kda_wide = true else if (std.mem.eql(u8, v, "0")) s.kda_wide = false else {
                 problem.* = "TF_GLM_KDA_DECODE_WIDE: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_PROMPT_PAIR")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else {
+                problem.* = "TF_GLM_PROMPT_PAIR: 0 or 1";
                 return error.BadSetting;
             }
         }
@@ -85,6 +93,21 @@ pub const Settings = struct {
                 },
             };
         };
+        if (get("TF_GLM_ABSORB_MMA")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.numerics.absorb_mma = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_ABSORB_MMA: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_W8A8")) |v| {
+            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "64")) s.numerics.w8a8 = true else if (std.mem.eql(u8, v, "32")) {
+                s.numerics.w8a8 = true;
+                s.numerics.w8a8_g32 = true;
+            } else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_W8A8: 0, 1 (a scale per 64 inputs) or 32 (per 32)";
+                return error.BadSetting;
+            }
+        }
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -94,6 +117,18 @@ pub const Settings = struct {
             return error.BadSetting;
         }
         return s;
+    }
+};
+
+/// Opt-in prompt kernels whose sums round differently from the default path (a KL check each, off by default).
+pub const Numerics = packed struct(u32) {
+    absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt's absorb_q and expand_v as head-batched tensor-core GEMMs
+    w8a8: bool = false, // TF_GLM_W8A8=1: packed 8-bit prompt linears on int8 activations (per row and 64-group scales)
+    w8a8_g32: bool = false, // TF_GLM_W8A8=32: the same with an activation scale per 32 inputs
+    unused: u29 = 0,
+
+    pub fn bits(n: Numerics) u32 {
+        return @bitCast(n);
     }
 };
 
@@ -107,7 +142,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 12, // this struct's version
+    layout: u32 = 14, // this struct's version (13 was num3's numerics or prefill3's pair alone)
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -117,6 +152,7 @@ pub const Fingerprint = extern struct {
     split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring
     kda_wide: u32,
     pieces: u32,
+    pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
     layers: u32, // TF_GLM_LAYERS (0: all)
     mtp: u32, // 1: the MTP head loads and runs (drafts on); 2: and DFlash2 (--drafter), whose rounds gather
     vision: u32 = 0, // --vision's image tokens (0: off): rank 0 sends image rows every rank must hold
@@ -125,6 +161,7 @@ pub const Fingerprint = extern struct {
     max_videos: u32 = 0,
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -143,6 +180,7 @@ pub const Fingerprint = extern struct {
         split,
         kda_wide,
         pieces,
+        pair,
         layers,
         mtp,
         vision,
@@ -151,6 +189,7 @@ pub const Fingerprint = extern struct {
         max_videos,
         max_frames,
         bits,
+        numerics,
         capacity,
         heat_high,
         heat_low,
@@ -179,9 +218,11 @@ pub const Fingerprint = extern struct {
             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
             .kda_wide = @intFromBool(s.kda_wide),
             .pieces = s.pieces,
+            .pair = @intFromBool(s.pair),
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .numerics = s.numerics.bits(),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -209,6 +250,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "split",
             "kda_wide",
             "pieces",
+            "pair",
             "layers",
             "mtp",
             "vision",
@@ -217,6 +259,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_videos",
             "max_frames",
             "bits",
+            "numerics",
             "capacity",
             "heat_high",
             "heat_low",
@@ -317,6 +360,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
         .pieces => "TF_GLM_OVERLAP_PIECES",
+        .pair => "TF_GLM_PROMPT_PAIR",
         .layers => "TF_GLM_LAYERS",
         .mtp => "--no-drafts given to some ranks and not others",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
@@ -325,6 +369,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

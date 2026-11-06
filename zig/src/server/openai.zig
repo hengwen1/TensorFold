@@ -330,6 +330,7 @@ const Run = struct {
 
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+        if (reply.response_channel == .structured_json) return null;
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
@@ -399,6 +400,7 @@ const Run = struct {
         const message = json.newObject(r.a) catch return;
         message.put(r.a, "role", .{ .string = "assistant" }) catch return;
         message.put(r.a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content }) catch return;
+        if (reply.reasoning) |t| if (t.len > 0) message.put(r.a, "reasoning_content", .{ .string = t }) catch return; // rendered where the template keeps it
         if (calls) |c| message.put(r.a, "tool_calls", .{ .array = c }) catch return;
         if (r.turn) |t| t.remember(r.a, r.plan.input, .{ .object = message });
         warm.reply(r.srv, r.plan.input, .{ .object = message }, reply.thinking, reply.effort, reply.prompt_tokens);
@@ -505,21 +507,22 @@ const Run = struct {
 
     fn stream(r: *Run, gone: Gone, field: []const u8) void {
         const a = r.a;
-        const tools = r.plan.input.tools.len > 0;
+        const has_tools = r.plan.input.tools.len > 0;
         var cx: Cx = .{ .a = a };
         // Context-window refusals stay streamed; other pre-admission refusals retain their HTTP status.
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
             break :blk ready.prepared;
         };
+        const tools = has_tools and prepared.response_channel != .structured_json;
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) r.srv.release(prepared.preparing, prepared.request);
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };

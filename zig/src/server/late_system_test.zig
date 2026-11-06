@@ -549,3 +549,33 @@ test "tool visibility HTTP: whole replies retain an unoffered call" {
 test "tool visibility HTTP: streamed replies retain an unoffered call" {
     try unofferedVisible(true);
 }
+
+test "a tool-call reply warms the tool turn's opening and a plain reply the user turn's" {
+    var text: DropLate = .{};
+    var backend: Capture = .{ .reply = prose_reply, .warm_turns = true };
+    defer std.testing.allocator.free(backend.prompt);
+    defer std.testing.allocator.free(backend.background_prompt);
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    const called = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
+    defer std.testing.allocator.free(called.body);
+    try std.testing.expectEqual(@as(u16, 200), called.status);
+    const after_call = try promptText(backend.background_prompt);
+    defer std.testing.allocator.free(after_call);
+    // the next message is a tool result: the pass ends at its opening, with the call in place
+    try std.testing.expect(std.mem.endsWith(u8, after_call, "[tool]"));
+    try std.testing.expect(std.mem.indexOf(u8, after_call, "[user]A") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_call, "\"name\":\"lookup\"") != null);
+    backend.reply = "plain words";
+    const answered = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
+    defer std.testing.allocator.free(answered.body);
+    try std.testing.expectEqual(@as(u16, 200), answered.status);
+    const after_answer = try promptText(backend.background_prompt);
+    defer std.testing.allocator.free(after_answer);
+    try std.testing.expect(std.mem.endsWith(u8, after_answer, "[assistant]plain words\n[user]"));
+}

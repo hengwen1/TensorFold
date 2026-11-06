@@ -55,6 +55,8 @@ pub const sample = @import("sample.zig");
 pub const rank_scatter = @import("rank_scatter.zig");
 pub const relay_plan = @import("relay_plan.zig");
 pub const tp_group = @import("tp_group.zig");
+pub const ce_push = @import("ce_push.zig");
+pub const p2p_gather = @import("p2p_gather.zig");
 pub const tp_watch = @import("tp_watch.zig");
 pub const p2p_report = @import("p2p_report.zig");
 pub const ck = @import("ck.zig");
@@ -102,6 +104,8 @@ test {
     _ = @import("experts_waves.zig");
     _ = @import("sample.zig");
     _ = @import("roce.zig");
+    _ = @import("p2p_gather.zig");
+    _ = @import("ce_push.zig");
     _ = @import("roce_nap.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");

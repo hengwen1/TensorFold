@@ -24,6 +24,11 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
+/// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
+/// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
+/// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
+/// chunk gate once real work waits (cuda_lanes.zig `cancelled`), keeping the states it reached.
+pub const warm_quiet: u64 = 150 * std.time.ns_per_ms;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 
@@ -129,18 +134,24 @@ const Owned = struct {
 
 const env = @import("sys").env;
 
-/// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
-fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
+/// The send/recv the prompt exchange will use, connected now, before the weights fill memory (connected on first use,
+/// ibv_reg_mr can fail): direct split (TF_GLM_PREFILL_REDUCE=split) reaches every peer; ring sends to the next rank
+/// and takes from the previous, as cuda_relay does; gather posts no point-to-point exchange at all, so on a fabric where
+/// some ranks reach only their neighbours (a ring of four without a switch) nothing is connected across it.
+fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group, set: ranks.Settings) !void {
+    if (!set.split) return; // gather: all-gathers only, which NCCL's rings connect at the first collective
     const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
     var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
     defer buf.free();
     var s = try cuda.Stream.init(d, false);
     defer s.deinit();
+    const next = (g.rank + 1) % g.world;
+    const prev = (g.rank + g.world - 1) % g.world;
     try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart");
     const posted: anyerror!void = post: {
         for (0..g.world) |peer| if (peer != g.rank) {
-            g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
-            g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == next) g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == prev) g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
         };
         break :post {};
     };
@@ -217,10 +228,10 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
-    if (p.world > 1) try warmPeers(ctx.d, &own.group);
+    if (p.world > 1) try warmPeers(ctx.d, &own.group, set);
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
     errdefer own.e.deinit();
     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
         var problem: []const u8 = "";
@@ -267,6 +278,16 @@ fn finishRank(a: OpenArgs) !Loaded {
     }
     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
     errdefer if (own.group.fast) |f| f.deinit();
+    try @import("cuda_p2p.zig").open(gpa, ctx.d, &own.group, own.e.stream, own.e.m.glue.p2p_gather); // both ranks, or neither
+    errdefer if (own.group.p2p) |x| {
+        x.deinit();
+        own.group.p2p = null;
+    };
+    own.e.ce = try @import("cuda_ce.zig").open(gpa, ctx.d, &own.group, own.e.stream, &own.e.bp, own.e.c.hidden, set.split and !set.ring);
+    errdefer if (own.e.ce) |x| {
+        x.deinit();
+        own.e.ce = null;
+    };
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
@@ -345,14 +366,22 @@ pub fn snap_ready(ptr: *engine.Engine, budget: u64) !u64 {
 fn readySnapshots(ptr: *anyopaque, budget: u64) !void {
     const own: *Owned = @ptrCast(@alignCast(ptr));
     const x: follow.Leader = .{ .e = own.e, .link = &own.link }; // its steps wake the ranks asleep on their lines
-    try x.snapshots(budget);
+    // TF_GLM_HOST_CACHE_GIB, rank 0's: GiB of pinned host pages over all ranks (0: none; unset: a share of what's available)
+    const asked = try snapshots.host_tier.asked(if (std.c.getenv("TF_GLM_HOST_CACHE_GIB")) |v| std.mem.span(v) else null);
+    const host = try x.snapshots(budget, asked);
     try x.idle(); // no stream yet: they sleep again until the first
+    std.log.info("prompt cache: {d:.1} GiB of device pages and {d:.1} GiB of pinned host memory a rank ({d:.1} GiB over the {d} ranks{s})", .{ @as(f64, @floatFromInt(budget)) / (1 << 30), @as(f64, @floatFromInt(host)) / (1 << 30), @as(f64, @floatFromInt(host * own.e.share.world)) / (1 << 30), own.e.share.world, if (asked == snapshots.host_tier.auto) "; TF_GLM_HOST_CACHE_GIB unset: a quarter of the host's available memory, at most 16 GiB" else "" });
+}
+
+/// The host tier's bytes past the device pages: the prompt cache's budget holds both (native/cuda_snaps cacheBudget).
+pub fn snap_host_tier(ptr: *engine.Engine) u64 {
+    return if (ptr.snap_pages) |*p| p.hostBytes() else 0;
 }
 
 pub fn snap_charged(ptr: *anyopaque, saved: *anyopaque) u64 {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
     const k: *engine.Kept = @ptrCast(@alignCast(saved));
-    return e.snaps.get(k.id).?.lease.ids.items.len * snapshots.pages.page;
+    return e.snaps.get(k.id).?.lease.count() * snapshots.pages.page;
 }
 
 pub fn snap_spare(ptr: *anyopaque) u64 {
@@ -404,6 +433,7 @@ fn close(ptr: *anyopaque) void {
 /// What a rank owns, freed by rank 0's close and by a follower before it leaves.
 fn release(own: *Owned) void {
     own.link.deinit();
+    if (own.e.ce) |x| x.deinit(); // before the buffers it maps go with the engine
     if (own.e.images) |v| v.deinit();
     own.e.deinit();
     own.group.close();
@@ -414,15 +444,20 @@ fn release(own: *Owned) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
+        error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
+        error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
+        error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
+        error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
         error.TooManyRanks => std.fmt.comptimePrint(
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },
         ),
-        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4 and MIXED_PRECISION checkpoints (the log names what config.json has)",
+        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
+        error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
         error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
         else => null,
     };
@@ -436,10 +471,10 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
 }
 
 test "a checkpoint refused for its format, at the entry or by the loader, is explained" {
-    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat }) |e| try std.testing.expect(explain(null, e) != null);
+    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.UnreadableExl3 }) |e| try std.testing.expect(explain(null, e) != null);
 }
 
-test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
+test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and 1 page like on, others are refused" {
     try std.testing.expect(!try paging(null, 1, false));
     try std.testing.expect(!try paging("auto", 1, false));
     for ([_]usize{ 2, 3, 16 }) |w| {
@@ -452,18 +487,21 @@ test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and ot
         try std.testing.expect(!try paging("off", w, false));
         try std.testing.expect(!try paging("0", w, false));
         try std.testing.expect(try paging("all", w, false));
+        try std.testing.expectError(error.BadKvPages, paging("yes", w, false));
     }
+    try std.testing.expect(explain(null, error.BadKvPages) != null);
 }
 
-test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all are refused by name" {
+test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all page" {
     for ([_]usize{ 1, 2, 3, 16 }) |w| {
         try std.testing.expect(!try paging(null, w, true));
         try std.testing.expect(!try paging("auto", w, true));
         try std.testing.expect(!try paging("off", w, true));
         try std.testing.expect(!try paging("0", w, true));
-        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expectError(error.Fp8OnPages, paging(v, w, true));
+        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expect(try paging(v, w, true));
     }
     try std.testing.expect(explain(null, error.Fp8OnPages) != null);
+    try std.testing.expect(explain(null, error.PoolTooSmall) != null);
 }
 
 test "capacity keeps a verify window past the context and a multiple of 64" {

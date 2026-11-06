@@ -75,6 +75,7 @@ pub const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+    warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk: the family's `warm_quiet`
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
@@ -130,7 +131,7 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
+        h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -371,7 +372,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const layout = wrapped.layout;
     var paged: ?kv_pages.Plan = null;
     const streams = if (layout) |l| blk: {
-        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded)) orelse return null;
+        // the reserve the room was measured past, for a refusal's fit; the smallest state, for the device cache's rule
+        const facts: kv_pages.Facts = .{
+            .reserve = .{ .bytes = after.reserve, .least = @intFromFloat(budget.floor(after.unified).least * (1 << 30)), .limited = after.limit != null },
+            .min_state = if (comptime @hasDecl(F, "snap_min_bytes")) F.snap_min_bytes(loaded.target) else 0,
+        };
+        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts) orelse return null;
         break :blk paged.?.lanes;
     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -405,22 +411,23 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.readiness(F);
     const held = served.stream_bytes * (streams -| free);
     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
-    const cache = kept.copied;
-    const cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
+    var cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
     const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), @intCast(window), kept, o.kv8);
     h.startup = try std.fmt.allocPrint(gpa, @import("cuda_startup.zig").format, .{
         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), @import("cuda_startup.zig").rows(F, loaded), if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (@hasDecl(F, "snap_save") and cache > 0) {
+    const kept_budget: u64 = if (comptime @hasDecl(F, "snap_save")) try kv_pages.storeBudget(F, loaded.target, kept) else 0; // card and host tier
+    if (cache_capacity) |*c| c.budget_bytes = kept_budget; // the startup warning and metrics read what the store keeps in
+    if (@hasDecl(F, "snap_save") and kept_budget > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         errdefer gpa.destroy(store);
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else if (comptime cuda_disk.keptDisk(F)) |K| &K.image else null;
         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
-        store.* = pc.Store.init(gpa, copies, snaps.passRules(F, @import("cuda_startup.zig").rows(F, loaded)), if (@hasDecl(F, "snap_slots")) cache else try snaps.cacheBudget(F, loaded.target, cache));
+        store.* = pc.Store.init(gpa, copies, snaps.passRules(F, @import("cuda_startup.zig").rows(F, loaded)), kept_budget);
         errdefer {
             const disk = store.disk;
             store.deinit();
@@ -429,6 +436,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
         h.store = store;
+        if (@hasDecl(F, "warm_quiet")) h.warm_quiet = F.warm_quiet;
         if (o.learn_conversations) if (o.learn) |root| {
             if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
             if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);

@@ -27,7 +27,11 @@ pub const Ffn = union(enum) { dense: mlp.Layer, moe: moe.Layer };
 pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: glue.Norm, post_norm: glue.Norm, mixer: Mixer, ffn: Ffn };
 
 /// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer (NVFP4 experts), shared_head.norm, 4-bit draft head.
-pub const Mtp = struct { enorm: u64, hnorm: u64, eh: u64, norm: u64, layer: Layer, draft: q4.Q4 };
+pub const Mtp = struct { enorm: u64, hnorm: u64, eh: u64, norm: u64, layer: Layer };
+
+/// The heads a load brings beside the target: none (--no-drafts), the 4-bit draft head alone (DFlash2 borrows it for
+/// its block's logits and never runs the target MTP layer), or the MTP layer with the draft head its chains read.
+pub const Heads = enum { none, draft, mtp };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
 pub const Tools = struct { pack_dense: cuda.Function, lane: *const cuda.qmmf.Lane, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
@@ -43,7 +47,7 @@ pub const Weights = struct {
     norm: glue.Norm = .{ .bf16 = 0 },
     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
-    exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
+    draft_head: ?q4.Q4 = null, // quantize4 of this rank's head rows: the MTP chains' and DFlash2's draft logits
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
@@ -440,7 +444,6 @@ const Loader = struct {
         var x3: ?exl3.Experts = null;
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
-            if (!x3.?.shx) L.w.exl3_shx = false;
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
@@ -540,7 +543,7 @@ fn recipeTable(r: *const core.modelopt.Recipes) ?*const core.modelopt.Recipes {
 }
 
 /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
+pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, heads: Heads) !Weights {
     var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
     errdefer w.deinit();
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
@@ -559,7 +562,15 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     w.norm = try L.norm("norm.weight", .{}, "norm");
     const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
     w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
-    if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
+    const heads_load = @import("cuda_mtp_load.zig");
+    switch (heads) {
+        .none => {},
+        .draft => w.draft_head = try heads_load.draft(&L, &head_ck), // the target MTP layer stays on disk
+        .mtp => if (c.mtp > 0) {
+            w.mtp = try heads_load.load(&L);
+            w.draft_head = try heads_load.draft(&L, &head_ck);
+        },
+    }
     return w;
 }
 

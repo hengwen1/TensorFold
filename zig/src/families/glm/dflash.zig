@@ -27,7 +27,7 @@ pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
 pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
 pub const MAX_S: usize = 16; // streams one block pass drafts for
 pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
-pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
+pub const MAX_CTX: usize = 4096; // context rows one ingest takes (a prompt chunk's)
 pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
@@ -38,7 +38,8 @@ pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
 pub fn rawBytes(bits: u8, world: usize) usize {
     const ff: usize = if (world == 2) FF / 2 else FF; // the MLP width a rank holds, as dflash_load splits it
     const nk: usize = @max(5 * D * D, 2 * ff * D); // fc, or gate and up stacked
-    return if (bits == 4) nk / 2 + 2 * nk / 32 + 1024 else 256;
+    // the 32-group scratch (TF_GLM_DFLASH2_Q32) doubles the scales and biases: sized for it at either setting
+    return if (bits == 4) nk / 2 + 2 * nk / 16 + 1024 else 256;
 }
 
 /// glm_dflash's functions.
@@ -54,6 +55,7 @@ pub const Kernels = struct {
     top16_part: cuda.Function,
     top16_merge: cuda.Function,
     gsum: cuda.Function,
+    gsum32: cuda.Function, // the 32-group sums (TF_GLM_DFLASH2_Q32's linears)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -62,16 +64,22 @@ pub const Kernels = struct {
     }
 };
 
-/// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose) or bf16 tiled for glm_mm.
-pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
+/// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose), the same at 32 groups
+/// (TF_GLM_DFLASH2_Q32: the reference engine's granularity), or bf16 tiled for glm_mm.
+pub const Lin = union(enum) { q4: q4.Q4, q4g32: q4.Q4, bf16: mm.Tiled };
 
 /// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
 pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+
+/// A ring's `first` before any row of its sequence is in it.
+pub const no_rows: i64 = std.math.maxInt(i64);
 
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
     ring: ?cuda.DeviceBuffer = null,
     from: i64 = 0, // the first position the ring holds for this sequence
+    first: i64 = no_rows, // prompt rows held: the first of the run in the ring that ends at `end` (no_rows: none yet)
+    end: i64 = 0,
     v_step: u64 = 0, // the verify that wrote its rows (Drafter.verifies then)
     v_row0: usize = 0,
     v_rows: usize = 0,
@@ -79,7 +87,7 @@ pub const Slot = struct {
 };
 
 /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null };
+pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, keyed: ?select.Keyed = null };
 
 /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
 pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
@@ -202,6 +210,32 @@ pub const Drafter = struct {
     pub fn restart(dr: *Drafter, i: u32, from: usize) !void {
         const s = try dr.slot(i);
         s.from = @intCast(from);
+        s.first = no_rows;
+        s.end = @intCast(from);
+        s.v_rows = 0;
+    }
+
+    /// Slot `i`'s ring (made on first use), for a kept state to copy out of or into.
+    pub fn ringPtr(dr: *Drafter, i: u32) !u64 {
+        return (try dr.slot(i)).ring.?.ptr;
+    }
+
+    /// Where the context rows a state kept at `at` carries start: the prompt rows in the ring right up to `at`, at most
+    /// a window of them (null: the pass tapped none just before `at`, so the ring holds nothing a resume could use).
+    pub fn keptFrom(dr: *const Drafter, i: u32, at: usize) ?i64 {
+        if (i >= dr.slots.items.len) return null;
+        const s = &dr.slots.items[i];
+        const end: i64 = @intCast(at);
+        if (s.ring == null or s.first == no_rows or s.end != end or s.first >= end) return null;
+        return @max(@max(s.first, s.from), end - WIN);
+    }
+
+    /// A kept state's ring copied into slot `i`: its sequence's rows `from` .. `at` are in it, as a fresh pass left them.
+    pub fn resumeAt(dr: *Drafter, i: u32, from: i64, at: usize) !void {
+        const s = try dr.slot(i);
+        s.from = from;
+        s.first = from;
+        s.end = @intCast(at);
         s.v_rows = 0;
     }
 
@@ -209,7 +243,20 @@ pub const Drafter = struct {
     pub fn noteVerify(dr: *Drafter, i: u32, row0: usize, rows: usize, pos0: usize, first: bool) !void {
         if (first) dr.verifies += 1; // a shared verify's parts share one
         const s = try dr.slot(i);
-        s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
+        s.* = .{ .ring = s.ring, .from = s.from, .first = s.first, .end = s.end, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
+    }
+
+    /// TF_GLM_DFLASH2_RING_DIGEST=1 (a check, off by default): once a prompt is in, slot `i`'s whole context ring hashed
+    /// and logged for prompts of 8192 ids or more, so two runs (paired or a chunk at a time) can show the same context.
+    pub fn ringDigest(dr: *Drafter, e: anytype, i: u32, len: usize) !void {
+        const v = std.c.getenv("TF_GLM_DFLASH2_RING_DIGEST") orelse return;
+        if (!std.mem.eql(u8, std.mem.span(v), "1") or len < 8192) return; // long prompts only: a short one's time stays clean
+        const s = try dr.slot(i);
+        try e.stream.synchronize();
+        const host = try dr.gpa.alloc(u8, ring_bytes);
+        defer dr.gpa.free(host);
+        try s.ring.?.download(0, host);
+        std.log.info("dflash2: ring digest slot {d} after a {d}-id prompt: {x:0>16}", .{ i, len, std.hash.Wyhash.hash(0, host) });
     }
 
     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
@@ -220,6 +267,16 @@ pub const Drafter = struct {
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
     pub const promptSegment = ingestPrompt;
 
+    /// A paired step's second chunk whose tap rows are already in the context input from row `row0` (pairTaps).
+    pub const promptIn = ingestPromptIn;
+
+    /// Where a paired step's second chunk taps when the first's last `first_rows` rows go in too (cuda_prompt_pair):
+    /// the context input past them, idle through the pass. The first's ingest copies its rows in before them, then the
+    /// second's reads its own in place (promptIn), so a pair needs no tap rows of its own.
+    pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
+    }
+
     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
         var N: usize = 0;
@@ -228,7 +285,7 @@ pub const Drafter = struct {
         if (N > MAX_CTX) return error.DrafterContextTooWide;
         var row: usize = 0;
         for (runs) |r| {
-            try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
+            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // in place: promptIn
             for (0..r.n) |j| {
                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
                 dr.h_crings[row + j] = r.ring;
@@ -240,12 +297,15 @@ pub const Drafter = struct {
         try block.ingestPass(dr, e, N);
     }
 
-    /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
-    pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
-        if (reqs.len == 0) return;
+    /// Kept rows into each context and no block pass (a copy takes these streams' next windows): every rank.
+    pub fn ingestOnly(dr: *Drafter, e: anytype, reqs: []const Req) !void {
         if (reqs.len > MAX_S) return error.TooManyStreams;
-        var tm = try dr.mark(e, null);
         var runs: [MAX_S]Run = undefined;
+        try dr.ingest(e, runs[0..try dr.keptRuns(reqs, &runs)]);
+    }
+
+    /// Each request's kept verify rows as a context run (a context whose rows are gone restarts at its position).
+    fn keptRuns(dr: *Drafter, reqs: []const Req, runs: *[MAX_S]Run) !usize {
         var nr: usize = 0;
         for (reqs) |q| {
             const s = try dr.slot(q.slot);
@@ -258,7 +318,16 @@ pub const Drafter = struct {
             runs[nr] = .{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * TAP_ROW, .n = q.n, .pos0 = s.v_pos0 };
             nr += 1;
         }
-        try dr.ingest(e, runs[0..nr]);
+        return nr;
+    }
+
+    /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
+    pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
+        if (reqs.len == 0) return;
+        if (reqs.len > MAX_S) return error.TooManyStreams;
+        var tm = try dr.mark(e, null);
+        var runs: [MAX_S]Run = undefined;
+        try dr.ingest(e, runs[0..try dr.keptRuns(reqs, &runs)]);
         tm = try dr.mark(e, .{ tm, 0 });
         const S = reqs.len;
         for (reqs, 0..) |q, i| {
@@ -309,7 +378,32 @@ pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, ro
 }
 
 pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+    return ingestFrom(dr, e, i, start, rows, len, dr.taps_prefill, row0);
+}
+
+/// ingestPrompt of a chunk whose tap rows already sit in the context input from row `row0` on (a paired step's second
+/// chunk, tapped at pairTaps while the first's rows go in before them): the ingest reads them where they are, as the
+/// copy would have left them at row 0. Every one of its rows is in the last window.
+pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+    if (start < len -| @as(usize, @intCast(WIN)) or row0 > MAX_CTX or rows > MAX_CTX - row0) return error.BadPromptContext;
+    const cin = dr.cin;
+    defer dr.cin = cin;
+    dr.cin = cin + row0 * TAP_ROW;
+    return ingestFrom(dr, e, i, start, rows, len, dr.cin, 0);
+}
+
+/// A prompt chunk's rows in the last window from tap rows at `taps` (row `row0` on) into slot `i`'s ring, and the run
+/// the ring then holds (keptFrom's), whichever buffer they were tapped into.
+fn ingestFrom(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, taps: u64, row0: usize) !void {
     const s = try dr.slot(i);
-    const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
+    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, row0)) orelse return;
     try dr.ingest(e, &.{run});
+    noteRun(s, run);
+}
+
+/// The run slot `s`'s ring holds once `run` is in: it goes on from `end`, or starts again past a gap (rows a kept
+/// state may carry).
+pub fn noteRun(s: anytype, run: Run) void {
+    if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
+    s.end = run.pos0 + @as(i64, @intCast(run.n));
 }

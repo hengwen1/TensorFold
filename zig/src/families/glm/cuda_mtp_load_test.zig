@@ -92,8 +92,8 @@ test "MTP widened head and quantizer scratch drain before free on launch, wait, 
         Fake.contexts = 0;
         var d = Fake.driver();
         const f: cuda.Function = .{ .d = &d, .handle = null };
-        const qk: quant.Kernels = .{ .amax = f, .nvfp4 = f, .q4 = f };
-        const tk: q4.Kernels = .{ .group = f, .pack_dense = f, .transpose = f, .gb10 = false };
+        const qk: quant.Kernels = .{ .amax = f, .nvfp4 = f, .q4 = f, .q4g32 = f };
+        const tk: q4.Kernels = .{ .group = f, .group32 = f, .pack_dense = f, .pack_dense32 = f, .transpose = f, .gb10 = false };
         var fail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
         const allocator = if (phase == 3) fail.allocator() else gpa;
         var share: @import("cuda_shard.zig").Share = undefined;
