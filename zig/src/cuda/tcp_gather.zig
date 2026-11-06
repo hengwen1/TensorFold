@@ -159,15 +159,21 @@ const Channel = struct {
     net_ns: u64 = 0,
 
     fn fail(ch: *Channel, comptime fmt: []const u8, args: anytype) void {
+        if (ch.failed.swap(true, .acq_rel)) return;
         _ = std.fmt.bufPrint(ch.err[0 .. ch.err.len - 1], fmt, args) catch {};
-        ch.failed.store(true, .release);
         ch.g.failed.store(true, .release); // the whole path is off; check() raises it after the engine's synchronize
+        std.log.err("TCP all-gather worker failed: {s}", .{std.mem.sliceTo(&ch.err, 0)});
     }
 
     /// The worker: a job at a time, in order, each staged, exchanged and published without touching the caller.
     fn run(ch: *Channel) void {
         const d = ch.g.d;
         const cap = ch.g.cap;
+        // A fresh thread has no current context: every driver call below would fail with INVALID_CONTEXT.
+        if (d.api.cuCtxSetCurrent(ch.g.ctx) != abi.success) {
+            ch.fail("cuCtxSetCurrent (the worker thread)", .{});
+            return;
+        }
         while (true) {
             const tail = ch.tail.load(.acquire);
             if (ch.head.load(.monotonic) == tail) {
@@ -337,6 +343,7 @@ pub const Gather = struct {
     rails: [max_rails]u32 = @splat(0),
     peer_rails: [max_rails]u32 = @splat(0),
     n_rails: usize = 0,
+    ctx: abi.Context = null, // the engine thread's context; a worker thread must set it before any driver call
     channels: [max_channels]?*Channel = @splat(null),
     n_channels: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
@@ -361,6 +368,7 @@ pub const Gather = struct {
             .port = @intCast(std.math.clamp(envInt("TF_TCP_GATHER_PORT", 30680), 1024, 65535 - max_channels * max_conns)),
             .timeout_s = std.math.clamp(envInt("TF_TCP_GATHER_TIMEOUT_S", 60), 1, 3600),
         };
+        if (d.api.cuCtxGetCurrent(&self.ctx) != abi.success) return error.Setup; // the worker sets it current
         self.n_rails = parseRails("TF_TCP_GATHER_RAILS", &self.rails) catch return error.BadConfig;
         const peer_n = parseRails("TF_TCP_GATHER_PEER_RAILS", &self.peer_rails) catch return error.BadConfig;
         if (peer_n != self.n_rails) return error.BadConfig;
@@ -517,7 +525,10 @@ pub const Gather = struct {
         if (x.failed.load(.acquire)) return error.ProxyFailed;
         const ch = x.channel(s) catch return error.Setup;
         if (ch.failed.load(.acquire)) return error.ProxyFailed;
-        while (ch.tail.load(.acquire) - ch.head.load(.acquire) == depth) sleepMs(20);
+        while (ch.tail.load(.acquire) - ch.head.load(.acquire) == depth) {
+            if (ch.failed.load(.acquire)) return error.ProxyFailed;
+            sleepMs(20);
+        }
         ch.seq +%= 1;
         if (ch.seq == 0) ch.seq = 1; // 0 is the flag words' initial value
         const seq = ch.seq;
