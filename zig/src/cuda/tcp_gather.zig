@@ -212,7 +212,10 @@ pub const Gather = struct {
             }
             const job = x.jobs[x.head.load(.monotonic) % depth];
             x.head.store(x.head.load(.monotonic) + 1, .release);
-            if (x.debug) std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}", .{ job.id, job.bytes >> 10, job.slot, job.seq });
+            if (x.debug) {
+                const words: [*]const u32 = @ptrCast(@alignCast(x.flags.bytes.ptr));
+                std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}, flags done={d} ready[0..{d}]={any}", .{ job.id, job.bytes >> 10, job.slot, job.seq, words[0], x.n_slots, x.seqs[0..x.n_slots] });
+            }
 
             const host = x.host.bytes[0..job.bytes];
             const peer = x.host.bytes[x.cap .. x.cap + job.bytes];
@@ -285,6 +288,13 @@ pub const Gather = struct {
             if (!x.running.load(.acquire)) return error.Stopped;
             if (rc == 0) { // idle: a second a tick. Progress resets the budget, so a busy exchange never times out.
                 ticks += 1;
+                if (x.debug and ticks % 5 == 0) {
+                    std.log.warn("tcp-gather: job {d} idle {d}s, {d} stripe(s) active", .{ id, ticks, n });
+                    for (stripes[0..x.conns], 0..) |st, k| {
+                        if (!st.sending and !st.receiving) continue;
+                        std.log.warn("tcp-gather:   conn {d}: send {d}/{d} (+{d} hdr), recv hdr {d}, recv {d}/{d} [{d}-{d}]", .{ k, st.send_at - st.send_end + (st.send_end - st.send_at), st.send_end - st.send_at, st.sent_header, st.got_header, st.recv_at, st.recv_end - st.recv_at, st.recv_at, st.recv_end });
+                    }
+                }
                 if (ticks > x.timeout_s) return error.Setup;
                 continue;
             }
@@ -431,6 +441,7 @@ pub const Gather = struct {
         };
         keep = true;
         std.log.info("TCP all-gather: {d} rail(s), {d} connection(s), shards {d}-{d} KiB over the rails", .{ x.n_rails, x.conns, x.min_bytes >> 10, x.cap >> 10 });
+        if (x.debug) std.log.info("tcp-gather: flags at 0x{x} (done) and 0x{x}.. (ready), host 0x{x}, net stream 0x{x}", .{ x.flags_dev, x.flags_dev + 4, @intFromPtr(x.host.bytes.ptr), @intFromPtr(x.net.handle) });
         return x;
     }
 
