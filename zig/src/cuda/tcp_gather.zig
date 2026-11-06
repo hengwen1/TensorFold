@@ -161,6 +161,7 @@ const Channel = struct {
     fn fail(ch: *Channel, comptime fmt: []const u8, args: anytype) void {
         _ = std.fmt.bufPrint(ch.err[0 .. ch.err.len - 1], fmt, args) catch {};
         ch.failed.store(true, .release);
+        ch.g.failed.store(true, .release); // the whole path is off; check() raises it after the engine's synchronize
     }
 
     /// The worker: a job at a time, in order, each staged, exchanged and published without touching the caller.
@@ -232,6 +233,7 @@ const Channel = struct {
         var header: [header_bytes]u8 = undefined;
         std.mem.writeInt(u64, header[0..8], seq, .big);
         std.mem.writeInt(u64, header[8..16], host.len, .big);
+        const deadline = monotonicNs() + @as(i128, @intCast(ch.g.timeout_s)) * std.time.ns_per_s;
         while (true) {
             var fds: [max_conns]std.c.pollfd = undefined;
             var which: [max_conns]usize = undefined;
@@ -251,7 +253,11 @@ const Channel = struct {
             const rc = std.c.poll(@ptrCast(&fds), @intCast(n), 1000);
             if (rc < 0) return error.Setup;
             if (!ch.running.load(.acquire)) return error.Setup;
-            if (rc == 0) continue; // a tick to notice a stop
+            if (rc == 0) { // a tick to notice a stop, and a deadline so a silent peer fails the job
+                if (monotonicNs() > deadline) return error.Setup;
+                continue;
+            }
+            if (monotonicNs() > deadline) return error.Setup;
             for (0..n) |k| {
                 const revents = fds[k].revents;
                 if (revents == 0) continue;
@@ -377,12 +383,14 @@ pub const Gather = struct {
         return self;
     }
 
-    /// Whether a gather of `bytes` a rank goes this way: the size alone decides, so both ranks take one path.
+    /// Whether a gather of `bytes` on `s` goes this way: the size and the stream table decide, both the same on the
+    /// two ranks (they run the same forward, so their streams and call order agree).
     pub fn fits(x: *const Gather, s: abi.Stream, bytes: usize) bool {
-        _ = s;
         if (x.failed.load(.acquire)) return false;
         if (bytes < x.min_bytes or bytes > x.cap or bytes % 16 != 0) return false;
-        return true;
+        const n = x.n_channels.load(.acquire);
+        for (x.channels[0..n]) |maybe| if (maybe) |ch| if (ch.stream == s) return true;
+        return n < max_channels; // room for the channel this stream's first large gather would open
     }
 
     /// The channel for `s`, made on first use (both ranks reach the same call sites in the same order).
@@ -391,9 +399,9 @@ pub const Gather = struct {
         for (x.channels[0..n]) |maybe| if (maybe) |ch| if (ch.stream == s) return ch;
         if (n == max_channels) return error.Setup;
         // The index is agreed with the peer before any socket exists, so both ranks bind the same port block.
-        var agreed: [1]u32 = undefined;
+        var agreed: [2]u32 = undefined;
         x.group.gather(u32, x.d, Stream.borrowed(x.d, s), @intCast(n), &agreed) catch return error.Setup;
-        if (agreed[0] != n) return error.Setup;
+        if (agreed[0] != n or agreed[1] != n) return error.Setup;
         const ch = try openChannel(x, n, s);
         x.channels[n] = ch;
         x.n_channels.store(n + 1, .release);
@@ -415,13 +423,24 @@ pub const Gather = struct {
         ch.net = try Stream.init(x.d, true);
         errdefer ch.net.deinit();
         ch.n_conns = x.conns;
-        try connect(ch);
-        errdefer for (0..ch.n_conns) |i| closeFd(ch.fds[i]);
+        var ok: u32 = 1;
+        connect(ch) catch {
+            ok = 0;
+        };
 
-        // Both ranks say whether they connected; one failure leaves both on NCCL.
-        var peer_ok: [1]u32 = undefined;
-        x.group.gather(u32, x.d, Stream.borrowed(x.d, s), 1, &peer_ok) catch return error.Setup;
-        if (peer_ok[0] != 1) return error.Setup;
+        // Both ranks say whether they connected; one failure turns the path off on both (fits returns false, so every
+        // later gather stays on NCCL) and fails this one call the same way on both.
+        var both_ok: [2]u32 = undefined;
+        x.group.gather(u32, x.d, Stream.borrowed(x.d, s), ok, &both_ok) catch {
+            x.failed.store(true, .release);
+            return error.Setup;
+        };
+        if (both_ok[0] != 1 or both_ok[1] != 1) {
+            x.failed.store(true, .release);
+            for (0..ch.n_conns) |i| closeFd(ch.fds[i]);
+            std.log.warn("TCP all-gather: the rails' sockets did not open on both ranks; NCCL carries every gather", .{});
+            return error.Setup;
+        }
         ch.thread = try std.Thread.spawn(.{}, Channel.run, .{ch});
         return ch;
     }
@@ -447,6 +466,21 @@ pub const Gather = struct {
                 if (std.c.listen(fd, 1) != 0) {
                     closeFd(fd);
                     return error.Setup;
+                }
+                setNonBlocking(fd); // a peer that never connects must not hang the engine: poll with a deadline
+                var pfd: std.c.pollfd = .{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 };
+                const deadline = monotonicNs() + @as(i128, @intCast(x.timeout_s)) * std.time.ns_per_s;
+                while (true) {
+                    const rc = std.c.poll(@ptrCast(&pfd), 1, 1000);
+                    if (rc < 0) {
+                        closeFd(fd);
+                        return error.Setup;
+                    }
+                    if (rc > 0 and pfd.revents != 0) break;
+                    if (monotonicNs() > deadline) {
+                        closeFd(fd);
+                        return error.Setup;
+                    }
                 }
                 var peer_addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
                 var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
@@ -480,6 +514,7 @@ pub const Gather = struct {
     /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather), on `s`.
     pub fn gather(x: *Gather, s: abi.Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) Error!void {
         if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
+        if (x.failed.load(.acquire)) return error.ProxyFailed;
         const ch = x.channel(s) catch return error.Setup;
         if (ch.failed.load(.acquire)) return error.ProxyFailed;
         while (ch.tail.load(.acquire) - ch.head.load(.acquire) == depth) sleepMs(20);
@@ -496,7 +531,12 @@ pub const Gather = struct {
     /// An error if a worker gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
     pub fn check(x: *Gather) !void {
         if (!x.failed.load(.acquire)) return;
-        std.log.err("TCP all-gather failed: {s}", .{std.mem.sliceTo(&x.err, 0)});
+        var what: []const u8 = std.mem.sliceTo(&x.err, 0);
+        const n = x.n_channels.load(.acquire);
+        for (x.channels[0..n]) |maybe| if (maybe) |ch| {
+            if (ch.failed.load(.acquire) and what.len == 0) what = std.mem.sliceTo(&ch.err, 0);
+        };
+        std.log.err("TCP all-gather failed: {s}", .{what});
         return error.ProxyFailed;
     }
 
@@ -536,9 +576,23 @@ test "TCP all-gather: a size decides the path, and the range is inclusive" {
     x.min_bytes = 2 << 20;
     x.cap = 32 << 20;
     try std.testing.expect(!Gather.fits(&x, null, 1 << 20));
-    try std.testing.expect(Gather.fits(&x, null, 2 << 20));
+    try std.testing.expect(Gather.fits(&x, null, 2 << 20)); // room for a channel
     try std.testing.expect(Gather.fits(&x, null, 32 << 20));
     try std.testing.expect(!Gather.fits(&x, null, (32 << 20) + 16));
+    var fake: Channel = undefined; // fits reads the stream handle alone
+    fake.stream = @ptrFromInt(0x1002);
+    x.channels[0] = &fake;
+    x.n_channels.store(1, .release);
+    try std.testing.expect(Gather.fits(&x, @ptrFromInt(0x1002), 4 << 20)); // a known stream always fits
+    var i: usize = 1;
+    while (i + 1 < max_channels) : (i += 1) { // the table filling: an unknown stream fits while there is room
+        x.channels[i] = null;
+        x.n_channels.store(i + 1, .release);
+        try std.testing.expect(Gather.fits(&x, @ptrFromInt(0x1000 + i), 4 << 20));
+    }
+    x.channels[max_channels - 1] = null;
+    x.n_channels.store(max_channels, .release);
+    try std.testing.expect(!Gather.fits(&x, @ptrFromInt(0x9000), 4 << 20)); // full: a new stream stays on NCCL
     x.failed.store(true, .release);
     try std.testing.expect(!Gather.fits(&x, null, 4 << 20));
 }
